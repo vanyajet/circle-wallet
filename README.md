@@ -11,6 +11,7 @@ Fullstack-криптокошелёк на [Circle Developer-Controlled Wallets](
 - [`docs/design-doc.md`](docs/design-doc.md) — дизайн, потоки, матрица отказов;
 - [`docs/adr/`](docs/adr) — решения с альтернативами, плюсами и минусами;
 - [`docs/research/circle-api-notes.md`](docs/research/circle-api-notes.md) — исследование Circle API.
+- [`docs/interview-notes.md`](docs/interview-notes.md) — ключевые вопросы и ответы, результаты живого прогона.
 
 ---
 
