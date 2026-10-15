@@ -1,5 +1,10 @@
 import { createPublicKey, verify, type KeyObject } from 'node:crypto';
+import { isNotFound } from './errors';
 import type { CircleGateway } from './gateway';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Сколько помнить, что keyId неизвестен Circle: защита от флуда запросами со случайными keyId. */
+const UNKNOWN_KEY_TTL_MS = 10 * 60_000;
 
 /**
  * Проверка подписи вебхуков Circle (notifications v2).
@@ -11,6 +16,7 @@ import type { CircleGateway } from './gateway';
  */
 export class WebhookSignatureVerifier {
   private readonly keys = new Map<string, Promise<KeyObject>>();
+  private readonly unknownKeys = new Map<string, number>();
 
   constructor(private readonly circle: Pick<CircleGateway, 'getNotificationPublicKey'>) {}
 
@@ -20,7 +26,22 @@ export class WebhookSignatureVerifier {
    * чтобы Circle повторил доставку, — потерять настоящее событие хуже, чем принять его позже.
    */
   async verify(rawBody: Buffer, signatureB64: string, keyId: string): Promise<boolean> {
-    const key = await this.getKey(keyId);
+    // Неподписанный мусор не должен порождать запросы к Circle (и тратить общий rate limit API key).
+    if (!UUID_RE.test(keyId)) return false;
+    const unknownUntil = this.unknownKeys.get(keyId);
+    if (unknownUntil && unknownUntil > Date.now()) return false;
+
+    let key: KeyObject;
+    try {
+      key = await this.getKey(keyId);
+    } catch (error) {
+      // 404 — такого ключа у Circle нет: это не сбой доставки, а невалидная подпись.
+      if (isNotFound(error)) {
+        this.unknownKeys.set(keyId, Date.now() + UNKNOWN_KEY_TTL_MS);
+        return false;
+      }
+      throw error;
+    }
     const signature = Buffer.from(signatureB64, 'base64');
     if (verify('sha256', rawBody, key, signature)) return true;
 

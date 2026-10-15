@@ -296,16 +296,14 @@ function safeJsonParse(text: string): unknown {
  */
 export function parseNextPageAfter(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
-  for (const part of linkHeader.split(',')) {
-    const match = /<([^>]+)>\s*;\s*rel="?next"?/i.exec(part);
-    if (!match?.[1]) continue;
-    try {
-      return new URL(match[1], 'http://placeholder').searchParams.get('pageAfter');
-    } catch {
-      return null;
-    }
+  // Не делим заголовок по запятым: в URL могут быть запятые (walletIds=a,b,c). [^>]+ не выходит за пределы <...>.
+  const match = /<([^>]+)>\s*;\s*rel="?next"?/i.exec(linkHeader);
+  if (!match?.[1]) return null;
+  try {
+    return new URL(match[1], 'http://placeholder').searchParams.get('pageAfter');
+  } catch {
+    return null;
   }
-  return null;
 }
 
 const emptyToNull = (v: string | null | undefined): string | null => (v === undefined || v === null || v === '' ? null : v);

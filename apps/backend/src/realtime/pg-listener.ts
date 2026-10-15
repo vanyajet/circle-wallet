@@ -62,7 +62,9 @@ export class PgListener {
     this.reconnectAttempt = 0;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
-      client.query('SELECT 1').catch((err) => {
+      // Без таймаута «мёртвое» соединение (без RST) повисло бы на часы TCP keepalive — и SSE молча перестал бы работать.
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('heartbeat timeout')), 10_000));
+      Promise.race([client.query('SELECT 1'), timeout]).catch((err) => {
         this.options.logger.warn({ err }, 'LISTEN heartbeat failed');
         void this.reconnect(client);
       });

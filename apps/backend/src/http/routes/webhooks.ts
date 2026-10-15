@@ -54,8 +54,10 @@ export function webhooksRouter(ctx: AppContext, verifier: WebhookSignatureVerifi
     }
     const envelope = NotificationEnvelopeSchema.safeParse(json);
     if (!envelope.success) {
-      log.error({ issues: envelope.error.issues }, 'signed webhook has unexpected envelope');
-      res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Unexpected envelope' } });
+      // Подпись верна — это настоящее событие Circle неожиданной формы. 4xx не поможет (повтор будет тем же),
+      // поэтому подтверждаем и громко логируем; данные транзакций догонит reconciliation.
+      log.error({ issues: envelope.error.issues, body: rawBody.toString('utf8').slice(0, 4_000) }, 'signed webhook has unexpected envelope');
+      res.status(200).json({ received: true });
       return;
     }
 
