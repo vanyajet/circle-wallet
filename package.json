@@ -1,0 +1,32 @@
+{
+  "name": "circle-wallet",
+  "private": true,
+  "description": "Custodial crypto wallet on Circle Developer-Controlled Wallets (BASE-SEPOLIA)",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,worker,web -c blue,magenta,green \"pnpm --filter @circle-wallet/backend dev:api\" \"pnpm --filter @circle-wallet/backend dev:worker\" \"pnpm --filter @circle-wallet/web dev\"",
+    "dev:backend": "concurrently -n api,worker -c blue,magenta \"pnpm --filter @circle-wallet/backend dev:api\" \"pnpm --filter @circle-wallet/backend dev:worker\"",
+    "env:check": "pnpm --filter @circle-wallet/backend env:check",
+    "circle:register-secret": "pnpm --filter @circle-wallet/backend circle:register-secret",
+    "circle:bootstrap": "pnpm --filter @circle-wallet/backend circle:bootstrap",
+    "circle:subscribe": "pnpm --filter @circle-wallet/backend circle:subscribe",
+    "tunnel": "pnpm --filter @circle-wallet/backend tunnel",
+    "db:push": "node --env-file-if-exists=.env scripts/db-push.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6",
+    "prettier": "^3.9.10"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
+  }
+}
