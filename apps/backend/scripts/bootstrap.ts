@@ -7,7 +7,7 @@
  * Созданные id записываются в корневой .env. Строку treasury в БД создаёт сам api/worker при старте
  * (ensureTreasuryWallet), поэтому скрипту база не нужна.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createCircleClient } from '../src/circle';
 import { loadCircleConfig } from '../src/config';
 import { createLogger } from '../src/lib/logger';
@@ -16,11 +16,24 @@ import { upsertEnvValues } from './lib/env-file';
 const config = loadCircleConfig();
 const circle = createCircleClient(createLogger('bootstrap'), config);
 
+/**
+ * Детерминированный idempotency key (UUID v4-формата) из id API key и назначения.
+ * Если ответ Circle потерялся и скрипт запустили снова, Circle вернёт уже созданный объект, а не создаст второй.
+ */
+function stableKey(purpose: string): string {
+  const keyId = config.CIRCLE_API_KEY.split(':')[1] ?? '';
+  const bytes = createHash('sha256').update(`${keyId}:${purpose}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 let walletSetId = config.CIRCLE_WALLET_SET_ID;
 if (walletSetId) {
   console.log(`Wallet set уже задан: ${walletSetId}`);
 } else {
-  ({ id: walletSetId } = await circle.createWalletSet({ idempotencyKey: randomUUID(), name: 'circle-wallet' }));
+  ({ id: walletSetId } = await circle.createWalletSet({ idempotencyKey: stableKey('wallet-set'), name: 'circle-wallet' }));
   upsertEnvValues({ CIRCLE_WALLET_SET_ID: walletSetId });
   console.log(`Создан wallet set: ${walletSetId} (записан в .env)`);
 }
@@ -30,7 +43,7 @@ if (treasuryId) {
   console.log(`Treasury уже задан: ${treasuryId}`);
 } else {
   const wallet = await circle.createWallet({
-    idempotencyKey: randomUUID(),
+    idempotencyKey: stableKey(`treasury:${walletSetId}`),
     walletSetId,
     blockchain: config.CIRCLE_BLOCKCHAIN,
     name: 'treasury',

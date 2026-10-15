@@ -13,7 +13,8 @@ export async function subscribeWebhooks(circle: CircleClient, publicUrl: string)
   const existing = await circle.listSubscriptions();
 
   for (const sub of existing) {
-    if (sub.endpoint !== endpoint && sub.endpoint.endsWith(WEBHOOK_PATH)) {
+    // Удаляем только наши прошлые quick tunnel'ы — чужие подписки на том же аккаунте (другие окружения) не трогаем.
+    if (sub.endpoint !== endpoint && sub.endpoint.endsWith(`.trycloudflare.com${WEBHOOK_PATH}`)) {
       await circle.deleteSubscription(sub.id);
       console.log(`Удалена устаревшая подписка ${sub.id} → ${sub.endpoint}`);
     }
