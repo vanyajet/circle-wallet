@@ -13,7 +13,7 @@ import { parseUnits } from '@circle-wallet/shared';
 import { sql } from 'kysely';
 import type { CircleTransaction } from '../circle/gateway';
 import type { Token, TreasuryInbound, Wallet } from '../db/schema';
-import { enqueueJob, wakeJobs } from '../jobs/queue';
+import { enqueueJob, wakeWithdrawalsAwaitingLiquidity } from '../jobs/queue';
 import { isFailureState, isSuccessState, shouldApplyState } from './circle-state';
 import type { AppContext } from './context';
 import { custody, house, postLedgerTransaction } from './ledger';
@@ -93,12 +93,18 @@ export async function classifyTreasuryInbound(ctx: AppContext, treasuryInboundId
 
   // 1-2. Совпадение с известным sweep по id или txHash.
   let sweepId = await matchSweep(ctx, inbound);
+  let enrichmentFailed = false;
 
-  // Не нашли — обогащаем данные из REST (вебхук мог прийти без txHash/sourceAddress) и обновляем sweep'ы в сети.
+  // Не нашли — обогащаем данные из REST (вебхук мог прийти без txHash/sourceAddress/refId) и обновляем sweep'ы в сети.
   if (!sweepId) {
-    inbound = await enrichInbound(ctx, inbound);
-    await refreshSubmittedSweeps(ctx, inbound.token);
-    sweepId = await matchSweep(ctx, inbound);
+    const enriched = await enrichInbound(ctx, inbound);
+    inbound = enriched.inbound;
+    enrichmentFailed = enriched.failed;
+    sweepId = await matchSweepByRefId(ctx, enriched.refId);
+    if (!sweepId) {
+      await refreshSubmittedSweeps(ctx, inbound.token);
+      sweepId = await matchSweep(ctx, inbound);
+    }
   }
 
   if (sweepId) {
@@ -121,14 +127,17 @@ export async function classifyTreasuryInbound(ctx: AppContext, treasuryInboundId
     return finalize(ctx, inbound.id, 'HOUSE_FUNDING', null);
   }
 
-  // Источник неизвестен: если в сети есть sweep на ту же сумму — ждём его, иначе после выдержки считаем house funding.
-  const candidate = await ctx.db
-    .selectFrom('app.sweeps')
-    .select('id')
-    .where('token', '=', inbound.token)
-    .where('status', 'in', ['PENDING', 'SUBMITTED'])
-    .where('amount', '=', inbound.amount)
-    .executeTakeFirst();
+  // Источник неизвестен, потому что Circle сейчас недоступен — решать вслепую нельзя, ждём.
+  if (enrichmentFailed && age < UNKNOWN_SOURCE_TIMEOUT_MS) {
+    return { type: 'wait', delayMs: 30_000, reason: 'cannot fetch inbound details from Circle' };
+  }
+
+  // Источник неизвестен: если есть sweep на ту же сумму, ещё не сопоставленный ни с одним входящим
+  // (в сети или уже завершённый, но без txHash), — ждём сопоставления; иначе после выдержки считаем house funding.
+  let candidates = unmatchedSweeps(ctx, inbound.token).where('s.amount', '=', inbound.amount);
+  // Если хэш входящего известен, sweep с другим известным хэшем — точно не он (совпадающий нашёлся бы выше).
+  if (inbound.tx_hash) candidates = candidates.where('s.tx_hash', 'is', null);
+  const candidate = await candidates.executeTakeFirst();
   if (candidate && age < UNKNOWN_SOURCE_TIMEOUT_MS) {
     return { type: 'wait', delayMs: 30_000, reason: 'unknown source, matching sweep in flight' };
   }
@@ -153,39 +162,69 @@ async function matchSweep(ctx: AppContext, inbound: TreasuryInbound): Promise<st
   return byHash?.id ?? null;
 }
 
-async function enrichInbound(ctx: AppContext, inbound: TreasuryInbound): Promise<TreasuryInbound> {
-  if (inbound.tx_hash && inbound.source_address) return inbound;
+async function enrichInbound(
+  ctx: AppContext,
+  inbound: TreasuryInbound,
+): Promise<{ inbound: TreasuryInbound; refId: string | null; failed: boolean }> {
   try {
     const tx = await ctx.circle.getTransaction(inbound.circle_transaction_id, 'INBOUND');
-    if (tx.txHash || tx.sourceAddress) {
-      return await ctx.db
+    let row = inbound;
+    if ((!inbound.tx_hash && tx.txHash) || (!inbound.source_address && tx.sourceAddress)) {
+      row = await ctx.db
         .updateTable('app.treasury_inbounds')
         .set({ tx_hash: inbound.tx_hash ?? tx.txHash, source_address: inbound.source_address ?? tx.sourceAddress })
         .where('id', '=', inbound.id)
         .returningAll()
         .executeTakeFirstOrThrow();
     }
+    return { inbound: row, refId: tx.refId, failed: false };
   } catch (error) {
     ctx.logger.warn({ err: error, treasuryInboundId: inbound.id }, 'failed to enrich treasury inbound');
+    return { inbound, refId: null, failed: true };
   }
-  return inbound;
 }
 
-/** У SCA txHash появляется только на CONFIRMED — подтягиваем свежие состояния sweep'ов без хэша. */
+/** Если входящая нога несёт наш refId (sweep:<id>) — это точное сопоставление. */
+async function matchSweepByRefId(ctx: AppContext, refId: string | null): Promise<string | null> {
+  const id = refId?.startsWith('sweep:') ? refId.slice('sweep:'.length) : null;
+  if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return null;
+  const sweep = await ctx.db.selectFrom('app.sweeps').select('id').where('id', '=', id).executeTakeFirst();
+  return sweep?.id ?? null;
+}
+
+/** Sweep'ы, чья входящая нога на treasury ещё не найдена: активные или завершённые за последние сутки. */
+function unmatchedSweeps(ctx: AppContext, token: string) {
+  return ctx.db
+    .selectFrom('app.sweeps as s')
+    .select(['s.id', 's.status', 's.tx_hash', 's.circle_transaction_id'])
+    .where('s.token', '=', token)
+    .where((eb) =>
+      eb.or([
+        eb('s.status', 'in', ['PENDING', 'SUBMITTED']),
+        eb.and([eb('s.status', '=', 'COMPLETED'), eb('s.completed_at', '>', sql<Date>`now() - interval '1 day'`)]),
+      ]),
+    )
+    .where(({ not, exists, selectFrom }) =>
+      not(exists(selectFrom('app.treasury_inbounds as ti').select('ti.id').whereRef('ti.sweep_id', '=', 's.id'))),
+    );
+}
+
+/**
+ * У SCA txHash появляется только на CONFIRMED, а вебхук может прийти без него —
+ * подтягиваем свежее состояние несопоставленных sweep'ов без хэша, чтобы сравнить по txHash.
+ */
 async function refreshSubmittedSweeps(ctx: AppContext, token: string): Promise<void> {
-  const sweeps = await ctx.db
-    .selectFrom('app.sweeps')
-    .select(['id', 'circle_transaction_id'])
-    .where('token', '=', token)
-    .where('status', '=', 'SUBMITTED')
-    .where('tx_hash', 'is', null)
-    .limit(20)
-    .execute();
+  const sweeps = await unmatchedSweeps(ctx, token).where('s.tx_hash', 'is', null).limit(20).execute();
   for (const sweep of sweeps) {
     if (!sweep.circle_transaction_id) continue;
     try {
       const tx = await ctx.circle.getTransaction(sweep.circle_transaction_id, 'OUTBOUND');
-      await applySweepTransaction(ctx, tx, 'reconcile');
+      if (sweep.status === 'COMPLETED') {
+        // Завершённый sweep state machine уже не трогает — дописываем только хэш.
+        if (tx.txHash) await ctx.db.updateTable('app.sweeps').set({ tx_hash: tx.txHash }).where('id', '=', sweep.id).execute();
+      } else {
+        await applySweepTransaction(ctx, tx, 'reconcile');
+      }
     } catch (error) {
       ctx.logger.warn({ err: error, sweepId: sweep.id }, 'failed to refresh sweep');
     }
@@ -223,7 +262,7 @@ async function finalize(
           { account: house(row.token), direction: 'CREDIT', amount },
         ],
       });
-      await wakeJobs(trx, 'withdrawal.submit');
+      await wakeWithdrawalsAwaitingLiquidity(trx);
     }
     if (classification === 'UNCLASSIFIED') {
       ctx.logger.error({ treasuryInboundId: row.id }, 'treasury inbound could not be classified — manual review required');
