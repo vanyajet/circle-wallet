@@ -24,6 +24,8 @@ const child = spawn('cloudflared', ['tunnel', '--no-autoupdate', '--url', `http:
 const stop = () => child.kill('SIGTERM');
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
+// Если скрипт упал — не оставляем осиротевший cloudflared.
+process.on('exit', stop);
 child.on('exit', (code) => {
   console.log(`cloudflared завершился (code ${code})`);
   process.exit(code ?? 0);
@@ -44,6 +46,7 @@ const publicUrl = await new Promise<string>((resolve, reject) => {
 console.log(`Туннель: ${publicUrl} → http://localhost:${API_PORT}`);
 
 // Ждём, пока туннель реально начнёт проксировать (HEAD на наш webhook-роут отвечает 200).
+// DNS нового *.trycloudflare.com иногда появляется через 1–2 минуты (плюс негативный DNS-кеш ОС) — ждём до ~4 минут.
 for (let attempt = 1; ; attempt++) {
   try {
     const res = await fetch(`${publicUrl}${WEBHOOK_PATH}`, { method: 'HEAD', signal: AbortSignal.timeout(5_000) });
@@ -52,7 +55,7 @@ for (let attempt = 1; ; attempt++) {
   } catch {
     console.log(`Туннель ещё не доступен... (попытка ${attempt})`);
   }
-  if (attempt >= 30) throw new Error('Туннель не стал доступен. Запущен ли api (pnpm dev)?');
+  if (attempt >= 80) throw new Error('Туннель не стал доступен. Запущен ли api (pnpm dev)?');
   await new Promise((r) => setTimeout(r, 2_000));
 }
 
