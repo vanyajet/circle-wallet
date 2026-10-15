@@ -4,6 +4,23 @@
  * Запросы описаны zod-схемами: бэкенд по ним валидирует вход, фронт проверяет формы.
  * Ответы описаны TypeScript-типами: их формирует наш же бэкенд, рантайм-валидация на фронте не нужна.
  * Все суммы передаются десятичными строками в единицах токена ("12.5"), даты — ISO-8601 строками.
+ *
+ * Маршруты:
+ *   GET  /tokens                              → TokensListDto
+ *   GET  /users                               → UsersListDto (новые сверху)
+ *   POST /users            CreateUserRequest  → 201 UserSummaryDto (кошелёк создаётся асинхронно: walletStatus=PENDING)
+ *   GET  /users/:id                           → UserDetailsDto
+ *   GET  /users/:id/operations?limit&cursor   → OperationsPageDto (депозиты и выводы, новые сверху)
+ *   POST /users/:id/withdrawals  + заголовок Idempotency-Key (UUID), CreateWithdrawalRequest → 202 OperationDto
+ *   GET  /users/:id/events                    → SSE (события одного пользователя)
+ *   GET  /events                              → SSE (все события: список пользователей, ops)
+ *   GET  /ops/overview                        → OpsOverviewDto
+ * Ошибки — ApiErrorDto с HTTP-статусом:
+ *   400 VALIDATION_ERROR | INVALID_AMOUNT | INVALID_ADDRESS | TOKEN_NOT_SUPPORTED | IDEMPOTENCY_KEY_REQUIRED
+ *   404 NOT_FOUND
+ *   409 IDEMPOTENCY_KEY_REUSED | WALLET_NOT_READY
+ *   422 INSUFFICIENT_FUNDS | ADDRESS_NOT_ALLOWED
+ *   503 SERVICE_UNAVAILABLE, 500 INTERNAL_ERROR
  */
 import { z } from 'zod';
 
@@ -43,6 +60,10 @@ export interface TokenDto {
   decimals: number;
   blockchain: string;
   contractAddress: string;
+}
+
+export interface TokensListDto {
+  items: TokenDto[];
 }
 
 export type WalletStatus = 'PENDING' | 'ACTIVE';
