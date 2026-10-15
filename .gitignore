@@ -37,3 +37,4 @@ coverage/
 
 # --- git worktrees агентов Claude Code ---
 .claude/worktrees/
+.vitest/
