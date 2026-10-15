@@ -220,11 +220,12 @@ export async function reconcileInbound(ctx: AppContext): Promise<string> {
 export async function reconcileBalances(ctx: AppContext): Promise<string> {
   const wallets = await ctx.db
     .selectFrom('app.wallets')
-    .select(['id', 'circle_wallet_id'])
+    .select(['id', 'kind', 'circle_wallet_id'])
     .where('status', '=', 'ACTIVE')
     .where('circle_wallet_id', 'is not', null)
     .execute();
   let checked = 0;
+  let mismatches = 0;
   for (const wallet of wallets) {
     try {
       const balances = await ctx.circle.getWalletBalances(wallet.circle_wallet_id!);
@@ -232,21 +233,25 @@ export async function reconcileBalances(ctx: AppContext): Promise<string> {
         const onChainRaw = balances.find((b) => b.tokenId === token.circle_token_id)?.amount ?? '0';
         const onChain = parseUnits(onChainRaw, token.decimals);
         const ledger = await getAccountBalance(ctx.db, custody(wallet.id, token.symbol));
+        const inFlightOut = await outgoingInFlight(ctx, wallet.id, wallet.kind, token.symbol);
         if (onChain === 0n && ledger === 0n) continue;
+        const values = {
+          ledger_custody: ledger.toString(),
+          in_flight_out: inFlightOut.toString(),
+          on_chain: onChain.toString(),
+        };
         await ctx.db
           .insertInto('app.balance_checks')
-          .values({ wallet_id: wallet.id, token: token.symbol, ledger_custody: ledger.toString(), on_chain: onChain.toString() })
-          .onConflict((oc) =>
-            oc.columns(['wallet_id', 'token']).doUpdateSet({
-              ledger_custody: ledger.toString(),
-              on_chain: onChain.toString(),
-              checked_at: new Date(),
-            }),
-          )
+          .values({ wallet_id: wallet.id, token: token.symbol, ...values })
+          .onConflict((oc) => oc.columns(['wallet_id', 'token']).doUpdateSet({ ...values, checked_at: new Date() }))
           .execute();
-        if (onChain < ledger) {
-          // На кошельке меньше, чем учтено в леджере — тревога: такого быть не должно.
-          ctx.logger.error({ walletId: wallet.id, token: token.symbol, ledger: ledger.toString(), onChain: onChain.toString() }, 'custody mismatch: on-chain below ledger');
+        // Ожидаемый on-chain = CUSTODY − исходящие в пути. Меньше — тревога: такого быть не должно.
+        if (onChain < ledger - inFlightOut) {
+          mismatches++;
+          ctx.logger.error(
+            { walletId: wallet.id, token: token.symbol, ...values },
+            'custody mismatch: on-chain below expected ledger balance',
+          );
         }
         checked++;
       }
@@ -254,5 +259,28 @@ export async function reconcileBalances(ctx: AppContext): Promise<string> {
       ctx.logger.warn({ err: error, walletId: wallet.id }, 'reconcile.balances: failed to fetch balances');
     }
   }
-  return `checked=${checked}`;
+  return `checked=${checked} mismatches=${mismatches}`;
+}
+
+/**
+ * Исходящие переводы кошелька, которые могли уже уйти on-chain, но ещё не проведены в леджере:
+ * для deposit-кошелька — незавершённые sweep, для treasury — выводы в SUBMITTING/SUBMITTED.
+ */
+async function outgoingInFlight(ctx: AppContext, walletId: string, kind: 'DEPOSIT' | 'TREASURY', token: string): Promise<bigint> {
+  const row =
+    kind === 'DEPOSIT'
+      ? await ctx.db
+          .selectFrom('app.sweeps')
+          .select(sql<string>`coalesce(sum(amount), 0)::text`.as('total'))
+          .where('wallet_id', '=', walletId)
+          .where('token', '=', token)
+          .where('status', 'in', ['PENDING', 'SUBMITTED'])
+          .executeTakeFirstOrThrow()
+      : await ctx.db
+          .selectFrom('app.withdrawals')
+          .select(sql<string>`coalesce(sum(amount), 0)::text`.as('total'))
+          .where('token', '=', token)
+          .where('status', 'in', ['SUBMITTING', 'SUBMITTED'])
+          .executeTakeFirstOrThrow();
+  return BigInt(row.total);
 }

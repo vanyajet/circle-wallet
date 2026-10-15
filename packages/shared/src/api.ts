@@ -173,8 +173,13 @@ export interface OpsBalanceCheckDto {
   address: string | null;
   token: string;
   ledgerCustody: string;
+  /** Исходящие переводы в пути (sweep с deposit-кошелька / выводы с treasury): on-chain уже ушли, в леджере — ещё нет. */
+  inFlightOut: string;
   onChain: string;
-  /** on-chain − ledger. Отрицательное значение — тревога: на кошельке меньше, чем мы считаем. */
+  /**
+   * on-chain − (ledger − inFlightOut). Отрицательное значение — тревога: на кошельке меньше, чем должно быть.
+   * Положительное временно нормально (депозиты, ещё не финализированные, неклассифицированные поступления).
+   */
   difference: string;
   checkedAt: string;
 }

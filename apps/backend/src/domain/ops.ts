@@ -67,7 +67,7 @@ export async function getOpsOverview(ctx: AppContext): Promise<OpsOverviewDto> {
   const balanceChecks = await ctx.db
     .selectFrom('app.balance_checks as b')
     .innerJoin('app.wallets as w', 'w.id', 'b.wallet_id')
-    .select(['b.wallet_id', 'w.kind', 'w.address', 'b.token', 'b.ledger_custody', 'b.on_chain', 'b.checked_at'])
+    .select(['b.wallet_id', 'w.kind', 'w.address', 'b.token', 'b.ledger_custody', 'b.in_flight_out', 'b.on_chain', 'b.checked_at'])
     .orderBy('w.kind', 'desc')
     .orderBy('b.checked_at', 'desc')
     .limit(100)
@@ -110,8 +110,9 @@ export async function getOpsOverview(ctx: AppContext): Promise<OpsOverviewDto> {
         address: b.address,
         token: b.token,
         ledgerCustody: formatUnits(BigInt(b.ledger_custody), d),
+        inFlightOut: formatUnits(BigInt(b.in_flight_out), d),
         onChain: formatUnits(BigInt(b.on_chain), d),
-        difference: formatUnits(BigInt(b.on_chain) - BigInt(b.ledger_custody), d),
+        difference: formatUnits(BigInt(b.on_chain) - (BigInt(b.ledger_custody) - BigInt(b.in_flight_out)), d),
         checkedAt: b.checked_at.toISOString(),
       };
     }),

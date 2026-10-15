@@ -9,7 +9,7 @@ const WALLET_KIND_LABELS: Record<OpsBalanceCheckDto['walletKind'], string> = {
   TREASURY: 'Treasury',
 };
 
-const COLUMNS = ['Кошелёк', 'Адрес', 'Токен', 'По леджеру', 'On-chain', 'Разница', 'Проверено'];
+const COLUMNS = ['Кошелёк', 'Адрес', 'Токен', 'По леджеру', 'Исходящие в пути', 'On-chain', 'Разница', 'Проверено'];
 
 export function BalanceChecksTable({ checks }: { checks: OpsBalanceCheckDto[] }) {
   return (
@@ -17,7 +17,7 @@ export function BalanceChecksTable({ checks }: { checks: OpsBalanceCheckDto[] })
       <Table head={COLUMNS}>
         {checks.length === 0 && <EmptyRow colSpan={COLUMNS.length}>Сверок пока не было</EmptyRow>}
         {checks.map((check) => {
-          // difference = on-chain − ledger; отрицательная — на кошельке меньше, чем мы считаем (тревога).
+          // difference = on-chain − (ledger − в пути); отрицательная — на кошельке меньше, чем должно быть (тревога).
           const negative = check.difference.trim().startsWith('-');
           return (
             <tr key={`${check.walletId}:${check.token}`} className={negative ? 'bg-red-50' : undefined}>
@@ -27,6 +27,7 @@ export function BalanceChecksTable({ checks }: { checks: OpsBalanceCheckDto[] })
               </Td>
               <Td>{check.token}</Td>
               <Td className="tabular-nums">{check.ledgerCustody}</Td>
+              <Td className="tabular-nums">{check.inFlightOut}</Td>
               <Td className="tabular-nums">{check.onChain}</Td>
               <Td className={`tabular-nums ${negative ? 'font-semibold text-red-700' : ''}`}>{check.difference}</Td>
               <Td className="whitespace-nowrap text-gray-600">{formatDateTime(check.checkedAt)}</Td>

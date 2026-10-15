@@ -203,6 +203,7 @@ export interface BalanceChecksTable {
   wallet_id: string;
   token: string;
   ledger_custody: Numeric;
+  in_flight_out: Generated<string>;
   on_chain: Numeric;
   checked_at: Generated<Date>;
 }
