@@ -1,0 +1,42 @@
+{
+  "name": "@circle-wallet/backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:api": "node --env-file-if-exists=../../.env --import tsx --watch src/entrypoints/api.ts",
+    "dev:worker": "node --env-file-if-exists=../../.env --import tsx --watch src/entrypoints/worker.ts",
+    "start:api": "node --env-file-if-exists=../../.env --import tsx src/entrypoints/api.ts",
+    "start:worker": "node --env-file-if-exists=../../.env --import tsx src/entrypoints/worker.ts",
+    "env:check": "node --env-file-if-exists=../../.env --import tsx scripts/env-check.ts",
+    "circle:register-secret": "node --env-file-if-exists=../../.env --import tsx scripts/register-entity-secret.ts",
+    "circle:bootstrap": "node --env-file-if-exists=../../.env --import tsx scripts/bootstrap.ts",
+    "circle:subscribe": "node --env-file-if-exists=../../.env --import tsx scripts/subscribe-webhooks.ts",
+    "tunnel": "node --env-file-if-exists=../../.env --import tsx scripts/tunnel.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@circle-wallet/shared": "workspace:*",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "kysely": "^0.29.6",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "tsx": "^4.23.15",
+    "viem": "^2.57.7",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@circle-fin/developer-controlled-wallets": "^10.8.1",
+    "@testcontainers/postgresql": "^12.2.1",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
+    "pino-pretty": "^13.2.0",
+    "typescript": "~5.9.3",
+    "vitest": "^5.0.5"
+  }
+}
