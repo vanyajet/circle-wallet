@@ -9,7 +9,7 @@
 import { parseUnits } from '@circle-wallet/shared';
 import { sql } from 'kysely';
 import type { CircleTxType } from '../circle/gateway';
-import { enqueueJob } from '../jobs/queue';
+import { ensureJob } from '../jobs/queue';
 import { applyCircleTransaction } from './circle-events';
 import type { AppContext } from './context';
 import { getAccountBalance, custody } from './ledger';
@@ -17,96 +17,133 @@ import { getAccountBalance, custody } from './ledger';
 /** Операции «тише» этого порога не трогаем: даём шанс вебхуку. */
 const STALE_AFTER = sql<Date>`now() - interval '30 seconds'`;
 const RESUBMIT_AFTER = sql<Date>`now() - interval '2 minutes'`;
-const BATCH = 50;
+const BATCH = 25;
 /** Перекрытие окна сканирования входящих: транзакция могла проиндексироваться у Circle с задержкой. */
 const INBOUND_OVERLAP_MS = 15 * 60_000;
 const INBOUND_CURSOR = 'reconcile.inbound';
+const PAGE_SIZE = 50;
+const MAX_INBOUND_PAGES = 20;
 
 export async function reconcilePending(ctx: AppContext): Promise<string> {
-  let refreshed = 0;
+  // Часть 1 (без вызовов Circle): у каждой незавершённой операции должна быть задача-«двигатель».
+  // ensureJob не ставит дубль, пока такая задача ждёт или ВЫПОЛНЯЕТСЯ — иначе два воркера параллельно
+  // повторяли бы отправку одного вывода.
   let requeued = 0;
+  const pendingWithdrawals = await ctx.db
+    .selectFrom('app.withdrawals')
+    .select('id')
+    .where('status', 'in', ['PENDING', 'SUBMITTING'])
+    .where('updated_at', '<', RESUBMIT_AFTER)
+    .limit(500)
+    .execute();
+  for (const w of pendingWithdrawals) {
+    await ensureJob(ctx.db, 'withdrawal.submit', { withdrawalId: w.id }, `withdrawal:${w.id}`);
+    requeued++;
+  }
+  const pendingSweeps = await ctx.db
+    .selectFrom('app.sweeps')
+    .select(['wallet_id', 'token'])
+    .where('status', '=', 'PENDING')
+    .where('updated_at', '<', RESUBMIT_AFTER)
+    .limit(500)
+    .execute();
+  for (const s of pendingSweeps) {
+    await ensureJob(ctx.db, 'sweep.schedule', { walletId: s.wallet_id, token: s.token }, `sweep:${s.wallet_id}:${s.token}`);
+    requeued++;
+  }
+  const completedInbounds = await ctx.db
+    .selectFrom('app.treasury_inbounds')
+    .select('id')
+    .where('classification', '=', 'PENDING')
+    .where('circle_state', '=', 'COMPLETE')
+    .where('updated_at', '<', STALE_AFTER)
+    .limit(500)
+    .execute();
+  for (const i of completedInbounds) {
+    await ensureJob(ctx.db, 'treasury-inbound.classify', { treasuryInboundId: i.id }, `treasury-inbound:${i.id}`);
+    requeued++;
+  }
+  const pendingWallets = await ctx.db
+    .selectFrom('app.wallets')
+    .select('id')
+    .where('status', '=', 'PENDING')
+    .where('created_at', '<', RESUBMIT_AFTER)
+    .limit(500)
+    .execute();
+  for (const w of pendingWallets) {
+    await ensureJob(ctx.db, 'wallet.create', { walletId: w.id }, `wallet:${w.id}`);
+    requeued++;
+  }
 
-  const refresh = async (circleTxId: string, txType: CircleTxType, label: string) => {
+  // Часть 2: опрос Circle по операциям «в сети». Порядок — по last_reconciled_at (nulls first):
+  // каждая проверка отправляет строку в конец очереди, поэтому «застрявшие» не вытесняют остальные.
+  let refreshed = 0;
+  const refresh = async (
+    table: 'app.withdrawals' | 'app.sweeps' | 'app.deposits' | 'app.treasury_inbounds',
+    id: string,
+    circleTxId: string,
+    txType: CircleTxType,
+  ) => {
     try {
       // txType обязателен: у внутреннего перевода ноги делят id (см. CircleGateway.getTransaction).
       const tx = await ctx.circle.getTransaction(circleTxId, txType);
       await applyCircleTransaction(ctx, tx, 'reconcile');
       refreshed++;
     } catch (error) {
-      ctx.logger.warn({ err: error, circleTxId, label }, 'reconcile: failed to refresh transaction');
+      ctx.logger.warn({ err: error, circleTxId, table }, 'reconcile: failed to refresh transaction');
+    } finally {
+      await ctx.db.updateTable(table).set({ last_reconciled_at: new Date() }).where('id', '=', id).execute();
     }
   };
 
-  const withdrawals = await ctx.db
+  const submittedWithdrawals = await ctx.db
     .selectFrom('app.withdrawals')
-    .select(['id', 'status', 'circle_transaction_id'])
-    .where('status', 'in', ['PENDING', 'SUBMITTING', 'SUBMITTED'])
+    .select(['id', 'circle_transaction_id'])
+    .where('status', '=', 'SUBMITTED')
     .where('updated_at', '<', STALE_AFTER)
-    .orderBy('updated_at')
+    .where((eb) => eb.or([eb('last_reconciled_at', 'is', null), eb('last_reconciled_at', '<', STALE_AFTER)]))
+    .orderBy(sql`last_reconciled_at nulls first`)
     .limit(BATCH)
     .execute();
-  for (const w of withdrawals) {
-    if (w.status === 'SUBMITTED' && w.circle_transaction_id) {
-      await refresh(w.circle_transaction_id, 'OUTBOUND', `withdrawal:${w.id}`);
-    } else {
-      // PENDING/SUBMITTING: гарантируем, что задача отправки существует (например, если прошлая ушла в DEAD).
-      await enqueueJob(ctx.db, 'withdrawal.submit', { withdrawalId: w.id }, { dedupeKey: `withdrawal:${w.id}` });
-      requeued++;
-    }
+  for (const w of submittedWithdrawals) {
+    if (w.circle_transaction_id) await refresh('app.withdrawals', w.id, w.circle_transaction_id, 'OUTBOUND');
   }
 
-  const sweeps = await ctx.db
+  const submittedSweeps = await ctx.db
     .selectFrom('app.sweeps')
-    .select(['id', 'status', 'wallet_id', 'token', 'circle_transaction_id'])
-    .where('status', 'in', ['PENDING', 'SUBMITTED'])
+    .select(['id', 'circle_transaction_id'])
+    .where('status', '=', 'SUBMITTED')
     .where('updated_at', '<', STALE_AFTER)
+    .where((eb) => eb.or([eb('last_reconciled_at', 'is', null), eb('last_reconciled_at', '<', STALE_AFTER)]))
+    .orderBy(sql`last_reconciled_at nulls first`)
     .limit(BATCH)
     .execute();
-  for (const s of sweeps) {
-    if (s.status === 'SUBMITTED' && s.circle_transaction_id) {
-      await refresh(s.circle_transaction_id, 'OUTBOUND', `sweep:${s.id}`);
-    } else {
-      await enqueueJob(ctx.db, 'sweep.schedule', { walletId: s.wallet_id, token: s.token }, { dedupeKey: `sweep:${s.wallet_id}:${s.token}` });
-      requeued++;
-    }
+  for (const s of submittedSweeps) {
+    if (s.circle_transaction_id) await refresh('app.sweeps', s.id, s.circle_transaction_id, 'OUTBOUND');
   }
 
-  const deposits = await ctx.db
+  const pendingDeposits = await ctx.db
     .selectFrom('app.deposits')
     .select(['id', 'circle_transaction_id'])
     .where('status', '=', 'PENDING')
     .where('updated_at', '<', STALE_AFTER)
+    .where((eb) => eb.or([eb('last_reconciled_at', 'is', null), eb('last_reconciled_at', '<', STALE_AFTER)]))
+    .orderBy(sql`last_reconciled_at nulls first`)
     .limit(BATCH)
     .execute();
-  for (const d of deposits) await refresh(d.circle_transaction_id, 'INBOUND', `deposit:${d.id}`);
+  for (const d of pendingDeposits) await refresh('app.deposits', d.id, d.circle_transaction_id, 'INBOUND');
 
-  const inbounds = await ctx.db
+  const openInbounds = await ctx.db
     .selectFrom('app.treasury_inbounds')
-    .select(['id', 'circle_transaction_id', 'circle_state', 'classification'])
+    .select(['id', 'circle_transaction_id'])
     .where('classification', '=', 'PENDING')
+    .where('circle_state', '<>', 'COMPLETE')
     .where('updated_at', '<', STALE_AFTER)
+    .where((eb) => eb.or([eb('last_reconciled_at', 'is', null), eb('last_reconciled_at', '<', STALE_AFTER)]))
+    .orderBy(sql`last_reconciled_at nulls first`)
     .limit(BATCH)
     .execute();
-  for (const i of inbounds) {
-    if (i.circle_state === 'COMPLETE') {
-      await enqueueJob(ctx.db, 'treasury-inbound.classify', { treasuryInboundId: i.id }, { dedupeKey: `treasury-inbound:${i.id}` });
-      requeued++;
-    } else {
-      await refresh(i.circle_transaction_id, 'INBOUND', `treasury-inbound:${i.id}`);
-    }
-  }
-
-  const wallets = await ctx.db
-    .selectFrom('app.wallets')
-    .select('id')
-    .where('status', '=', 'PENDING')
-    .where('created_at', '<', RESUBMIT_AFTER)
-    .limit(BATCH)
-    .execute();
-  for (const w of wallets) {
-    await enqueueJob(ctx.db, 'wallet.create', { walletId: w.id }, { dedupeKey: `wallet:${w.id}` });
-    requeued++;
-  }
+  for (const i of openInbounds) await refresh('app.treasury_inbounds', i.id, i.circle_transaction_id, 'INBOUND');
 
   return `refreshed=${refreshed} requeued=${requeued}`;
 }
@@ -136,13 +173,14 @@ export async function reconcileInbound(ctx: AppContext): Promise<string> {
     let pageAfter: string | undefined;
     try {
       // Ограничение числа страниц — защита от бесконечного цикла при некорректной пагинации.
-      for (let page = 0; page < 20; page++) {
+      let exhausted = false;
+      for (let page = 0; page < MAX_INBOUND_PAGES; page++) {
         const result = await ctx.circle.listTransactions({
           walletIds: chunk,
           txType: 'INBOUND',
           from: since.toISOString(),
           ...(pageAfter ? { pageAfter } : {}),
-          pageSize: 50,
+          pageSize: PAGE_SIZE,
         });
         for (const tx of result.items) {
           seen++;
@@ -152,9 +190,16 @@ export async function reconcileInbound(ctx: AppContext): Promise<string> {
             ctx.logger.warn({ err: error, circleTxId: tx.id }, 'reconcile.inbound: failed to apply transaction');
           }
         }
-        if (!result.nextPageAfter || result.items.length === 0) break;
-        pageAfter = result.nextPageAfter;
+        // Курсор из Link; если заголовка нет, но страница полная — продолжаем от последнего элемента.
+        const next = result.nextPageAfter ?? (result.items.length === PAGE_SIZE ? result.items.at(-1)!.id : null);
+        if (!next || result.items.length === 0) {
+          exhausted = true;
+          break;
+        }
+        pageAfter = next;
       }
+      // Упёрлись в лимит страниц — окно просмотрено не целиком: курсор двигать нельзя.
+      if (!exhausted) failedChunks++;
     } catch (error) {
       failedChunks++;
       ctx.logger.warn({ err: error }, 'reconcile.inbound: list transactions failed');

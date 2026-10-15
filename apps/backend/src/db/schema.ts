@@ -102,6 +102,8 @@ export interface DepositsTable {
   created_at: Generated<Date>;
   updated_at: Generated<Date>;
   completed_at: NullableTimestamp;
+  /** Когда операцию последний раз сверяли с Circle (reconcile.pending). */
+  last_reconciled_at: NullableTimestamp;
 }
 
 export interface WithdrawalsTable {
@@ -123,6 +125,8 @@ export interface WithdrawalsTable {
   updated_at: Generated<Date>;
   submitted_at: NullableTimestamp;
   completed_at: NullableTimestamp;
+  /** Когда операцию последний раз сверяли с Circle (reconcile.pending). */
+  last_reconciled_at: NullableTimestamp;
 }
 
 export interface SweepsTable {
@@ -140,6 +144,8 @@ export interface SweepsTable {
   updated_at: Generated<Date>;
   submitted_at: NullableTimestamp;
   completed_at: NullableTimestamp;
+  /** Когда операцию последний раз сверяли с Circle (reconcile.pending). */
+  last_reconciled_at: NullableTimestamp;
 }
 
 export interface TreasuryInboundsTable {
@@ -156,6 +162,8 @@ export interface TreasuryInboundsTable {
   created_at: Generated<Date>;
   updated_at: Generated<Date>;
   classified_at: NullableTimestamp;
+  /** Когда операцию последний раз сверяли с Circle (reconcile.pending). */
+  last_reconciled_at: NullableTimestamp;
 }
 
 export interface WebhookEventsTable {
