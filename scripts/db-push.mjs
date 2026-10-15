@@ -9,7 +9,7 @@ if (!url) {
   process.exit(1);
 }
 
-const result = spawnSync('supabase', ['db', 'push', '--db-url', url, '--include-all', ...process.argv.slice(2)], {
+const result = spawnSync('supabase', ['db', 'push', '--db-url', url, '--include-all', '--yes', ...process.argv.slice(2)], {
   stdio: 'inherit',
 });
 process.exit(result.status ?? 1);
