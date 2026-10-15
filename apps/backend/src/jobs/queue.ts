@@ -5,13 +5,15 @@
  *    если транзакция откатилась — задачи нет, если закоммитилась — задача гарантированно есть;
  *  - claim захватывает задачи через FOR UPDATE SKIP LOCKED с lease по часам БД;
  *    задача с истёкшим lease (воркер умер) захватывается снова;
- *  - complete/retry/... применяются только если воркер всё ещё владеет задачей (fencing по locked_by):
- *    результат «опоздавшего» воркера, чей lease уже перехватили, не перетрёт чужой.
+ *  - complete/retry/kill применяются только если воркер всё ещё владеет ИМЕННО ЭТОЙ попыткой
+ *    (fencing по locked_by + attempts): результат «опоздавшего» запуска, чей lease уже перехватили
+ *    (даже тем же воркером), не перетрёт результат нового запуска.
+ *  - все времена (run_at, lease) считаются по часам БД, а не приложения: расхождение часов не ломает расписание.
  */
-import { sql } from 'kysely';
+import { sql, type UpdateQueryBuilder, type UpdateResult } from 'kysely';
 import { isUniqueViolation } from '../db/errors';
 import type { Db, DbExecutor } from '../db/client';
-import type { Job } from '../db/schema';
+import type { Database, Job } from '../db/schema';
 
 export type JobKind =
   | 'wallet.create'
@@ -26,7 +28,8 @@ export type JobKind =
 export interface EnqueueOptions {
   /** Не больше одной ОЖИДАЮЩЕЙ задачи с таким ключом (см. миграцию jobs). */
   dedupeKey?: string;
-  runAt?: Date;
+  /** Отложить выполнение (считается от now() БД). */
+  delayMs?: number;
   maxAttempts?: number;
 }
 
@@ -42,6 +45,8 @@ const DEFAULT_MAX_ATTEMPTS: Record<JobKind, number> = {
   'reconcile.balances': 3,
 };
 
+const dbNowPlus = (ms: number) => sql<Date>`now() + make_interval(secs => ${Math.max(0, ms) / 1000})`;
+
 export async function enqueueJob(
   db: DbExecutor,
   kind: JobKind,
@@ -52,9 +57,36 @@ export async function enqueueJob(
       ${kind},
       ${JSON.stringify(payload)}::jsonb,
       ${options.dedupeKey ?? null},
-      coalesce(${options.runAt ?? null}::timestamptz, now()),
+      ${dbNowPlus(options.delayMs ?? 0)},
       ${options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS[kind]}
     )`.execute(db);
+}
+
+/**
+ * Поставить задачу, только если с таким ключом нет ни ожидающей, ни ВЫПОЛНЯЮЩЕЙСЯ задачи.
+ * Нужно reconciliation: обычный dedupe смотрит только на PENDING, и пока задача отправки вывода
+ * выполняется (RUNNING), второй запуск того же вывода параллельно был бы вреден.
+ */
+export async function ensureJob(
+  db: DbExecutor,
+  kind: JobKind,
+  payload: Record<string, unknown>,
+  dedupeKey: string,
+): Promise<void> {
+  const blocking = await db
+    .selectFrom('app.jobs')
+    .select('id')
+    .where('dedupe_key', '=', dedupeKey)
+    .where((eb) =>
+      eb.or([
+        eb('status', 'in', ['PENDING', 'RUNNING']),
+        // Недавно умершую задачу не воскрешаем сразу: иначе постоянная ошибка (например, конфигурации)
+        // превратится в бесконечный цикл. Через 10 минут — новая серия попыток.
+        eb.and([eb('status', '=', 'DEAD'), eb('finished_at', '>', sql<Date>`now() - interval '10 minutes'`)]),
+      ]),
+    )
+    .executeTakeFirst();
+  if (!blocking) await enqueueJob(db, kind, payload, { dedupeKey });
 }
 
 export async function claimJobs(db: Db, workerId: string, limit: number, leaseSeconds: number): Promise<Job[]> {
@@ -76,13 +108,23 @@ export async function claimJobs(db: Db, workerId: string, limit: number, leaseSe
   return result.rows;
 }
 
+/** Условие fencing: задача всё ещё у этого воркера и это та же попытка (reclaim увеличивает attempts). */
+type JobsUpdate = UpdateQueryBuilder<Database, 'app.jobs', 'app.jobs', UpdateResult>;
+
+function owned(job: Job, workerId: string) {
+  return (qb: JobsUpdate) =>
+    qb
+      .where('id', '=', job.id)
+      .where('locked_by', '=', workerId)
+      .where('attempts', '=', job.attempts)
+      .where('status', '=', 'RUNNING');
+}
+
 export async function completeJob(db: Db, job: Job, workerId: string): Promise<void> {
   await db
     .updateTable('app.jobs')
-    .set({ status: 'DONE', finished_at: new Date(), locked_by: null, locked_until: null, last_error: null })
-    .where('id', '=', job.id)
-    .where('locked_by', '=', workerId)
-    .where('status', '=', 'RUNNING')
+    .set({ status: 'DONE', finished_at: sql<Date>`now()`, locked_by: null, locked_until: null, last_error: null })
+    .$call(owned(job, workerId))
     .execute();
 }
 
@@ -103,24 +145,21 @@ export async function retryJob(
       .updateTable('app.jobs')
       .set({
         status: 'PENDING',
-        run_at: new Date(Date.now() + delayMs),
+        run_at: dbNowPlus(delayMs),
         locked_by: null,
         locked_until: null,
         last_error: error,
         ...(consumeAttempt ? {} : { attempts: sql<number>`greatest(attempts - 1, 0)` }),
       })
-      .where('id', '=', job.id)
-      .where('locked_by', '=', workerId)
-      .where('status', '=', 'RUNNING')
+      .$call(owned(job, workerId))
       .execute();
   } catch (e) {
     // Пока задача выполнялась, поставили такую же (dedupe_key свободен для PENDING) — эта больше не нужна.
     if (isUniqueViolation(e, 'jobs_dedupe_pending')) {
       await db
         .updateTable('app.jobs')
-        .set({ status: 'DONE', finished_at: new Date(), locked_by: null, locked_until: null, last_error: 'superseded' })
-        .where('id', '=', job.id)
-        .where('locked_by', '=', workerId)
+        .set({ status: 'DONE', finished_at: sql<Date>`now()`, locked_by: null, locked_until: null, last_error: 'superseded' })
+        .$call(owned(job, workerId))
         .execute();
       return;
     }
@@ -128,24 +167,38 @@ export async function retryJob(
   }
 }
 
-export async function killJob(db: Db, job: Job, workerId: string | null, error: string): Promise<void> {
-  let query = db
+export async function killJob(db: Db, job: Job, workerId: string, error: string): Promise<void> {
+  await db
     .updateTable('app.jobs')
-    .set({ status: 'DEAD', finished_at: new Date(), locked_by: null, locked_until: null, last_error: error })
-    .where('id', '=', job.id);
-  if (workerId) query = query.where('locked_by', '=', workerId);
-  await query.execute();
+    .set({ status: 'DEAD', finished_at: sql<Date>`now()`, locked_by: null, locked_until: null, last_error: error })
+    .$call(owned(job, workerId))
+    .execute();
 }
 
 /**
- * Разбудить ожидающие задачи вида kind прямо сейчас (например, выводы, ждущие ликвидности,
- * после того как sweep или house float её добавили). Вызывается внутри бизнес-транзакции.
+ * Разбудить задачи отправки выводов, ЖДУЩИХ ЛИКВИДНОСТИ (после sweep / house float / освобождения резерва).
+ * Будим только их: выводы с неизвестным исходом (SUBMITTING) ретраятся с backoff, и сбрасывать его нельзя —
+ * во время сбоя Circle это превратилось бы в шквал повторов.
  */
-export async function wakeJobs(db: DbExecutor, kind: JobKind): Promise<void> {
+export async function wakeWithdrawalsAwaitingLiquidity(db: DbExecutor): Promise<void> {
+  await sql`
+    update app.jobs j
+       set run_at = now()
+      from app.withdrawals w
+     where j.kind = 'withdrawal.submit'
+       and j.status = 'PENDING'
+       and j.run_at > now()
+       and w.id = (j.payload ->> 'withdrawalId')::uuid
+       and w.status = 'PENDING'
+       and w.awaiting_liquidity`.execute(db);
+}
+
+/** Разбудить ожидающие классификации входящих на treasury (после завершения sweep — у него появился txHash). */
+export async function wakeTreasuryClassification(db: DbExecutor): Promise<void> {
   await db
     .updateTable('app.jobs')
     .set({ run_at: sql<Date>`now()` })
-    .where('kind', '=', kind)
+    .where('kind', '=', 'treasury-inbound.classify')
     .where('status', '=', 'PENDING')
     .where('run_at', '>', sql<Date>`now()`)
     .execute();
