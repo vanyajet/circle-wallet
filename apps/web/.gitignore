@@ -1,0 +1,2 @@
+# Генерируется next dev/build и различается между ними — не коммитим (как в шаблоне create-next-app).
+next-env.d.ts
