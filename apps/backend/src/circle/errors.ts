@@ -58,6 +58,9 @@ export function classifyCircleError(error: CircleApiError): CircleErrorKind {
   if (status === undefined || contractViolation) return 'UNKNOWN_OUTCOME';
   if (code !== undefined && UNKNOWN_OUTCOME_CODES.has(code)) return 'UNKNOWN_OUTCOME';
   if (status >= 500) return 'UNKNOWN_OUTCOME';
+  // 408 timeout, 409 conflict («запрос с этим ключом ещё обрабатывается»), 425 too early —
+  // ответы, после которых нельзя утверждать, что перевод не создан.
+  if (status === 408 || status === 409 || status === 425) return 'UNKNOWN_OUTCOME';
   if (status === 429) return 'RETRYABLE';
   if (code !== undefined && RETRYABLE_CODES.has(code)) return 'RETRYABLE';
   if (status === 401 || status === 403 || (code !== undefined && CONFIG_CODES.has(code))) return 'CONFIG';

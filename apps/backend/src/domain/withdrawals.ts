@@ -21,7 +21,7 @@ import { isUniqueViolation } from '../db/errors';
 import type { Tx } from '../db/client';
 import type { Withdrawal, WithdrawalStatus } from '../db/schema';
 import { AppError, notFound } from '../lib/errors';
-import { enqueueJob, wakeJobs } from '../jobs/queue';
+import { enqueueJob, wakeWithdrawalsAwaitingLiquidity } from '../jobs/queue';
 import { isFailureState, isSuccessState, isTerminalState, shouldApplyState } from './circle-state';
 import type { AppContext } from './context';
 import { RetryLaterError } from './context';
@@ -75,6 +75,10 @@ export async function createWithdrawal(
 
       // Блокировка счёта сериализует параллельные выводы одного пользователя: второй увидит уже уменьшенный баланс.
       const available = await lockAccount(trx, userAvailable(userId, token.symbol));
+      // Повторная проверка ключа ПОСЛЕ блокировки: параллельный запрос с тем же ключом мог закоммитить вывод,
+      // пока мы ждали блокировку. Без этого мы ответили бы ему 422 «недостаточно средств» вместо того же вывода.
+      const concurrent = await findByIdempotencyKey(trx, userId, idempotencyKey);
+      if (concurrent) return { withdrawal: assertSameRequest(concurrent, requestHash), replayed: true };
       if (available.balance < amount) {
         throw new AppError('INSUFFICIENT_FUNDS', 422, 'Недостаточно средств', {
           available: formatUnits(available.balance, token.decimals),
@@ -211,8 +215,9 @@ export async function submitWithdrawal(ctx: AppContext, withdrawalId: string): P
     }
   }
 
+  let created: { id: string; state: string };
   try {
-    const created = await ctx.circle.createTransfer({
+    created = await ctx.circle.createTransfer({
       idempotencyKey: withdrawal.id,
       walletId: treasury.circle_wallet_id,
       tokenId: token.circle_token_id,
@@ -220,30 +225,46 @@ export async function submitWithdrawal(ctx: AppContext, withdrawalId: string): P
       amount: formatUnits(BigInt(withdrawal.amount), token.decimals),
       refId: withdrawalRefId(withdrawal.id),
     });
-    await ctx.db
-      .updateTable('app.withdrawals')
-      .set({
-        status: sql<WithdrawalStatus>`case when status = 'SUBMITTING' then 'SUBMITTED' else status end`,
-        circle_transaction_id: sql<string>`coalesce(circle_transaction_id, ${created.id})`,
-        circle_state: sql<string>`coalesce(circle_state, ${created.state})`,
-        submitted_at: new Date(),
-      })
-      .where('id', '=', withdrawal.id)
-      .execute();
-    ctx.logger.info({ withdrawalId: withdrawal.id, circleTransactionId: created.id }, 'withdrawal submitted to Circle');
-    return { type: 'done', result: 'SUBMITTED' };
   } catch (error) {
     if (isCircleError(error) && error.kind === 'DEFINITIVE') {
-      // Circle отказал по существу (невалидный адрес и т.п.) — перевод точно не создан: возвращаем деньги.
-      await ctx.db.transaction().execute((trx) =>
-        failWithdrawal(trx, withdrawal.id, 'REJECTED_BY_CIRCLE', error.message),
-      );
-      ctx.logger.warn({ withdrawalId: withdrawal.id, err: error }, 'withdrawal rejected by Circle');
-      return { type: 'done', result: 'FAILED:rejected' };
+      if (phase1.type === 'submit') {
+        // Первая попытка, и Circle отказал по существу (невалидный адрес и т.п.) — перевод точно не создан:
+        // возвращаем деньги.
+        await ctx.db.transaction().execute((trx) => failWithdrawal(trx, withdrawal.id, 'REJECTED_BY_CIRCLE', error.message));
+        ctx.logger.warn({ withdrawalId: withdrawal.id, err: error }, 'withdrawal rejected by Circle');
+        return { type: 'done', result: 'FAILED:rejected' };
+      }
+      // Повтор после неизвестного исхода: первый запрос мог создать перевод, а 4xx на повтор
+      // (например, «запрос с этим ключом ещё обрабатывается») не доказывает обратного.
+      // Освобождать резерв нельзя — ретраим; если не сойдётся, задача уйдёт в DEAD на ручной разбор.
+      ctx.logger.error({ withdrawalId: withdrawal.id, err: error }, 'definitive error on resubmit — keeping funds held');
     }
     // Исход неизвестен или временная ошибка — вывод остаётся SUBMITTING (резерв держится), задача повторится.
     throw error;
   }
+
+  // Ответ Circle применяем через ту же state machine, что и вебхуки: при повторе Circle может вернуть
+  // уже терминальное состояние (COMPLETE/FAILED), и оно должно провести SETTLE/RELEASE, а не «заморозить» вывод.
+  const result = await applyWithdrawalTransaction(
+    ctx,
+    {
+      id: created.id,
+      transactionType: 'OUTBOUND',
+      state: created.state,
+      walletId: treasury.circle_wallet_id,
+      tokenId: token.circle_token_id,
+      amount: null,
+      txHash: null,
+      refId: withdrawalRefId(withdrawal.id),
+      sourceAddress: null,
+      destinationAddress: withdrawal.destination_address,
+      errorReason: null,
+      errorDetails: null,
+    },
+    'submit',
+  );
+  ctx.logger.info({ withdrawalId: withdrawal.id, circleTransactionId: created.id, result }, 'withdrawal submitted to Circle');
+  return { type: 'done', result: 'SUBMITTED' };
 }
 
 async function inFlightAmount(trx: Tx, token: string): Promise<bigint> {
@@ -290,7 +311,13 @@ export async function applyWithdrawalTransaction(
       if (source === 'webhook') throw new RetryLaterError(`withdrawal for Circle tx ${tx.id} not found yet`);
       return 'IGNORED:unknown_outbound';
     }
-    if (isFinalStatus(withdrawal.status)) return `NOOP:${withdrawal.status}`;
+    if (isFinalStatus(withdrawal.status)) {
+      if (withdrawal.status === 'FAILED' && isSuccessState(tx.state)) {
+        // Такого быть не должно (резерв уже возвращён) — громко сигналим для ручного разбора.
+        ctx.logger.error({ withdrawalId: withdrawal.id, circleTransactionId: tx.id }, 'withdrawal COMPLETED after being marked FAILED — manual review');
+      }
+      return `NOOP:${withdrawal.status}`;
+    }
     if (!shouldApplyState(withdrawal.circle_state, tx.state)) {
       // Состояние то же (или старее), но id/хэш могли появиться впервые — дозаполним без смены статуса.
       if (!withdrawal.circle_transaction_id || (!withdrawal.tx_hash && tx.txHash)) {
@@ -366,7 +393,9 @@ export async function failWithdrawal(trx: Tx, withdrawalId: string, reason: stri
     .where('id', '=', withdrawalId)
     .forUpdate()
     .executeTakeFirstOrThrow();
-  if (isFinalStatus(withdrawal.status)) return;
+  // Освобождать резерв без события Circle можно, только пока перевод точно не создан:
+  // у вывода нет circle_transaction_id и он ещё не принят Circle (PENDING/SUBMITTING).
+  if (!(withdrawal.status === 'PENDING' || withdrawal.status === 'SUBMITTING') || withdrawal.circle_transaction_id) return;
   await trx
     .updateTable('app.withdrawals')
     .set({ status: 'FAILED', error_reason: reason, error_details: details, completed_at: new Date(), awaiting_liquidity: false })
@@ -377,6 +406,9 @@ export async function failWithdrawal(trx: Tx, withdrawalId: string, reason: stri
 
 async function releaseHold(trx: Tx, withdrawal: Withdrawal): Promise<void> {
   const amount = BigInt(withdrawal.amount);
+  // Тот же порядок блокировок, что в createWithdrawal (сначала USER_AVAILABLE, потом USER_HELD),
+  // иначе создание и отмена вывода одного пользователя могут поймать deadlock.
+  await lockAccount(trx, userAvailable(withdrawal.user_id, withdrawal.token));
   await postLedgerTransaction(trx, {
     kind: 'WITHDRAWAL_RELEASE',
     referenceId: withdrawal.id,
@@ -385,6 +417,6 @@ async function releaseHold(trx: Tx, withdrawal: Withdrawal): Promise<void> {
       { account: userAvailable(withdrawal.user_id, withdrawal.token), direction: 'CREDIT', amount },
     ],
   });
-  // Резерв ликвидности treasury освободился — другие выводы могут пойти сразу.
-  await wakeJobs(trx, 'withdrawal.submit');
+  // Резерв ликвидности treasury освободился — выводы, ждущие её, могут пойти сразу.
+  await wakeWithdrawalsAwaitingLiquidity(trx);
 }
