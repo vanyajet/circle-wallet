@@ -34,3 +34,6 @@ coverage/
 .vscode/*
 !.vscode/extensions.json
 .cache/
+
+# --- git worktrees агентов Claude Code ---
+.claude/worktrees/
