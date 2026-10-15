@@ -1,0 +1,36 @@
+# --- зависимости ---
+node_modules/
+.pnpm-store/
+
+# --- сборка ---
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+.turbo/
+
+# --- env и секреты (в репозиторий попадает только .env.example) ---
+.env
+.env.*
+!.env.example
+secrets/
+recovery_file_*.dat
+*.pem
+
+# --- supabase cli ---
+supabase/.temp/
+supabase/.branches/
+
+# --- логи и тесты ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+coverage/
+
+# --- ОС и IDE ---
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.cache/
