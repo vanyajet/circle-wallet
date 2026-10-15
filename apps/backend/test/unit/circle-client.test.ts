@@ -152,6 +152,8 @@ describe('CircleClient', () => {
   });
 });
 
+const KEY_ID = '11111111-1111-4111-8111-111111111111';
+
 describe('WebhookSignatureVerifier', () => {
   const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const publicKeyB64 = ec.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
@@ -162,14 +164,30 @@ describe('WebhookSignatureVerifier', () => {
   const signature = sign('sha256', body, ec.privateKey).toString('base64');
 
   it('принимает корректную подпись сырого тела', async () => {
-    expect(await verifier.verify(body, signature, 'key-1')).toBe(true);
+    expect(await verifier.verify(body, signature, KEY_ID)).toBe(true);
   });
 
   it('отклоняет изменённое тело и чужую подпись', async () => {
     const tampered = Buffer.from(body.toString().replace('n1', 'n2'));
-    expect(await verifier.verify(tampered, signature, 'key-1')).toBe(false);
+    expect(await verifier.verify(tampered, signature, KEY_ID)).toBe(false);
     const other = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-    expect(await verifier.verify(body, sign('sha256', body, other.privateKey).toString('base64'), 'key-1')).toBe(false);
+    expect(await verifier.verify(body, sign('sha256', body, other.privateKey).toString('base64'), KEY_ID)).toBe(false);
+  });
+
+  it('не ходит в Circle за ключом с невалидным keyId и запоминает неизвестные ключи (защита от флуда)', async () => {
+    let calls = 0;
+    const counting = new WebhookSignatureVerifier({
+      getNotificationPublicKey: async () => {
+        calls++;
+        throw new CircleApiError('not found', { method: 'GET', path: '/v2/notifications/publicKey/x', status: 404 });
+      },
+    });
+    expect(await counting.verify(body, signature, 'not-a-uuid')).toBe(false);
+    expect(calls).toBe(0);
+    const unknown = '33333333-3333-4333-8333-333333333333';
+    expect(await counting.verify(body, signature, unknown)).toBe(false);
+    expect(await counting.verify(body, signature, unknown)).toBe(false);
+    expect(calls).toBe(1);
   });
 
   it('пробрасывает ошибку получения ключа (вызывающий код ответит 503, Circle повторит)', async () => {
@@ -178,6 +196,6 @@ describe('WebhookSignatureVerifier', () => {
         throw new Error('Circle unavailable');
       },
     });
-    await expect(failing.verify(body, signature, 'key-x')).rejects.toThrow('Circle unavailable');
+    await expect(failing.verify(body, signature, '22222222-2222-4222-8222-222222222222')).rejects.toThrow('Circle unavailable');
   });
 });

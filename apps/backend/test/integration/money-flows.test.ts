@@ -69,7 +69,7 @@ async function deposit(walletCircleId: string, amount: string, tokenId = USDC_TO
 
 async function fundHouse(amount: string, tokenId = USDC_TOKEN_ID) {
   const treasury = await requireTreasuryWallet(env.db);
-  const tx = inbound(treasury.circle_wallet_id, amount, 'COMPLETE', { tokenId });
+  const tx = env.circle.addInbound(inbound(treasury.circle_wallet_id, amount, 'COMPLETE', { tokenId }));
   await applyCircleTransaction(env.ctx, tx, 'webhook');
   const row = await env.db
     .selectFrom('app.treasury_inbounds')
@@ -206,6 +206,16 @@ describe('выводы', () => {
     });
   });
 
+  it('параллельный повтор с тем же ключом на весь баланс возвращает тот же вывод, а не 422', async () => {
+    const { userId, wallet } = await newUserWithWallet('idem-full');
+    await deposit(wallet.circle_wallet_id!, '5');
+    const key = randomUUID();
+    const body = { token: 'USDC', amount: '5', destinationAddress: EXTERNAL };
+    const results = await Promise.all(Array.from({ length: 3 }, () => createWithdrawal(env.ctx, userId, key, body)));
+    expect(new Set(results.map((r) => r.withdrawal.id)).size).toBe(1);
+    expect(await getAccountBalance(env.db, userHeld(userId, 'USDC'))).toBe(usdc('5'));
+  });
+
   it('отклоняет опасные адреса и лишнюю точность суммы', async () => {
     const { userId, wallet } = await newUserWithWallet('validation');
     await deposit(wallet.circle_wallet_id!, '5');
@@ -273,6 +283,66 @@ describe('выводы', () => {
     await expectLedgerBalanced();
   });
 
+  it('4xx на ПОВТОРНУЮ отправку не освобождает резерв: первый перевод мог уже уйти', async () => {
+    const { userId, wallet } = await newUserWithWallet('resume-4xx');
+    await deposit(wallet.circle_wallet_id!, '4');
+    const { withdrawal } = await createWithdrawal(env.ctx, userId, randomUUID(), {
+      token: 'USDC',
+      amount: '4',
+      destinationAddress: EXTERNAL,
+    });
+    env.circle.dropNextTransferResponses = 1;
+    await expect(submitWithdrawal(env.ctx, withdrawal.id)).rejects.toThrow();
+    // Поиск по refId недоступен, а повтор получает «окончательный» 4xx.
+    env.circle.listFails = true;
+    env.circle.failNextTransferWith = new CircleApiError('conflict', {
+      method: 'POST',
+      path: '/v1/w3s/developer/transactions/transfer',
+      status: 409,
+    });
+    try {
+      await expect(submitWithdrawal(env.ctx, withdrawal.id)).rejects.toBeInstanceOf(CircleApiError);
+    } finally {
+      env.circle.listFails = false;
+    }
+    const row = await env.db.selectFrom('app.withdrawals').selectAll().where('id', '=', withdrawal.id).executeTakeFirstOrThrow();
+    expect(row.status).toBe('SUBMITTING');
+    expect(await getAccountBalance(env.db, userHeld(userId, 'USDC'))).toBe(usdc('4'));
+    expect(await getAccountBalance(env.db, userAvailable(userId, 'USDC'))).toBe(0n);
+
+    // Перевод на самом деле прошёл: вебхук COMPLETE находит вывод по refId и проводит SETTLE.
+    const transfer = env.circle.transfers.get(withdrawal.id)!;
+    const done = env.circle.setState(transfer.id, 'OUTBOUND', { state: 'COMPLETE' });
+    expect(await applyCircleTransaction(env.ctx, done, 'webhook')).toBe('APPLIED:COMPLETED');
+    expect(await getAccountBalance(env.db, userHeld(userId, 'USDC'))).toBe(0n);
+    await expectLedgerBalanced();
+  });
+
+  it('терминальное состояние в ответе на повтор проходит через state machine (вывод не «зависает»)', async () => {
+    const { userId, wallet } = await newUserWithWallet('replay-complete');
+    await deposit(wallet.circle_wallet_id!, '2');
+    const { withdrawal } = await createWithdrawal(env.ctx, userId, randomUUID(), {
+      token: 'USDC',
+      amount: '2',
+      destinationAddress: EXTERNAL,
+    });
+    env.circle.dropNextTransferResponses = 1;
+    await expect(submitWithdrawal(env.ctx, withdrawal.id)).rejects.toThrow();
+    // Пока ответ «терялся», перевод в Circle завершился; вебхуки тоже потерялись, поиск по refId недоступен.
+    const transfer = env.circle.transfers.get(withdrawal.id)!;
+    env.circle.setState(transfer.id, 'OUTBOUND', { state: 'COMPLETE' });
+    env.circle.listFails = true;
+    try {
+      expect(await submitWithdrawal(env.ctx, withdrawal.id)).toEqual({ type: 'done', result: 'SUBMITTED' });
+    } finally {
+      env.circle.listFails = false;
+    }
+    const row = await env.db.selectFrom('app.withdrawals').selectAll().where('id', '=', withdrawal.id).executeTakeFirstOrThrow();
+    expect(row.status).toBe('COMPLETED');
+    expect(await getAccountBalance(env.db, userHeld(userId, 'USDC'))).toBe(0n);
+    await expectLedgerBalanced();
+  });
+
   it('явный отказ Circle (4xx) переводит вывод в FAILED и возвращает средства', async () => {
     const { userId, wallet } = await newUserWithWallet('rejected');
     await deposit(wallet.circle_wallet_id!, '3');
@@ -327,11 +397,13 @@ describe('sweep и классификация входящих на treasury', (
     expect(await applyCircleTransaction(env.ctx, out, 'webhook')).toBe('APPLIED:COMPLETED');
 
     // Входящая нога на treasury: тот же id (внутренний перевод Circle), источник — наш deposit-адрес.
-    const leg = inbound(treasury.circle_wallet_id, '20', 'COMPLETE', {
-      id: sweep.circle_transaction_id!,
-      sourceAddress: wallet.address,
-      txHash: '0xsweephash',
-    });
+    const leg = env.circle.addInbound(
+      inbound(treasury.circle_wallet_id, '20', 'COMPLETE', {
+        id: sweep.circle_transaction_id!,
+        sourceAddress: wallet.address,
+        txHash: '0xsweephash',
+      }),
+    );
     await applyCircleTransaction(env.ctx, leg, 'webhook');
     const row = await env.db
       .selectFrom('app.treasury_inbounds')
@@ -345,6 +417,31 @@ describe('sweep и классификация входящих на treasury', (
     expect(await getAccountBalance(env.db, house('USDC'))).toBe(houseBefore);
     // Баланс пользователя sweep не меняет — меняется только место хранения.
     expect(await getAccountBalance(env.db, userAvailable(userId, 'USDC'))).toBe(usdc('20'));
+    await expectLedgerBalanced();
+  });
+
+  it('нога sweep без txHash и источника (другой id) не считается house float: сопоставление по refId', async () => {
+    const { wallet } = await newUserWithWallet('sweep-refid');
+    await deposit(wallet.circle_wallet_id!, '3');
+    const treasury = await requireTreasuryWallet(env.db);
+    const houseBefore = await getAccountBalance(env.db, house('USDC'));
+    expect(await runSweep(env.ctx, wallet.id, 'USDC')).toBe('SUBMITTED');
+    const sweep = await env.db.selectFrom('app.sweeps').selectAll().where('wallet_id', '=', wallet.id).executeTakeFirstOrThrow();
+    const out = env.circle.setState(sweep.circle_transaction_id!, 'OUTBOUND', { state: 'COMPLETE' });
+    await applyCircleTransaction(env.ctx, out, 'webhook');
+
+    // Вебхук входящей ноги — без хэша и источника, но REST отдаёт refId нашего sweep.
+    const leg = env.circle.addInbound(
+      inbound(treasury.circle_wallet_id, '3', 'COMPLETE', { sourceAddress: null, refId: `sweep:${sweep.id}` }),
+    );
+    await applyCircleTransaction(env.ctx, { ...leg, refId: null }, 'webhook');
+    const row = await env.db
+      .selectFrom('app.treasury_inbounds')
+      .select('id')
+      .where('circle_transaction_id', '=', leg.id)
+      .executeTakeFirstOrThrow();
+    expect(await classifyTreasuryInbound(env.ctx, row.id)).toEqual({ type: 'done', result: 'SWEEP' });
+    expect(await getAccountBalance(env.db, house('USDC'))).toBe(houseBefore);
     await expectLedgerBalanced();
   });
 

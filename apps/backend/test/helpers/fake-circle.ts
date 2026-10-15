@@ -27,6 +27,8 @@ export class FakeCircleGateway implements CircleGateway {
   dropNextTransferResponses = 0;
   /** Ошибка, которую бросит следующий createTransfer (до создания перевода). */
   failNextTransferWith: Error | null = null;
+  /** Поиск транзакций недоступен (например, мок без list-эндпоинта). */
+  listFails = false;
 
   registerWallet(wallet: CircleWalletInfo): void {
     this.wallets.set(wallet.id, wallet);
@@ -82,7 +84,8 @@ export class FakeCircleGateway implements CircleGateway {
       this.dropNextTransferResponses--;
       throw Object.assign(new Error('socket hang up'), { name: 'FetchError' });
     }
-    return { id: transfer.id, state: 'INITIATED' };
+    // Повтор с тем же ключом возвращает существующую транзакцию в её ТЕКУЩЕМ состоянии (как 200 у Circle).
+    return { id: transfer.id, state: this.transactions.get(`${transfer.id}:OUTBOUND`)!.state };
   }
 
   /** Сымитировать изменение состояния транзакции в Circle (то, о чём потом придёт вебхук). */
@@ -108,6 +111,7 @@ export class FakeCircleGateway implements CircleGateway {
   }
 
   async listTransactions(filter: ListTransactionsFilter): Promise<TransactionsPage> {
+    if (this.listFails) throw new Error('list transactions unavailable');
     const items = [...this.transactions.values()].filter(
       (t) =>
         (!filter.txType || t.transactionType === filter.txType) &&
