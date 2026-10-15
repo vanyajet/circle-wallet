@@ -234,7 +234,16 @@ export async function reconcileBalances(ctx: AppContext): Promise<string> {
         const onChain = parseUnits(onChainRaw, token.decimals);
         const ledger = await getAccountBalance(ctx.db, custody(wallet.id, token.symbol));
         const inFlightOut = await outgoingInFlight(ctx, wallet.id, wallet.kind, token.symbol);
-        if (onChain === 0n && ledger === 0n) continue;
+        if (onChain === 0n && ledger === 0n && inFlightOut === 0n) {
+          // Пустой кошелёк — сверять нечего; убираем прошлый результат, иначе на /ops осталась бы устаревшая
+          // «разница» от момента, когда sweep был в пути.
+          await ctx.db
+            .deleteFrom('app.balance_checks')
+            .where('wallet_id', '=', wallet.id)
+            .where('token', '=', token.symbol)
+            .execute();
+          continue;
+        }
         const values = {
           ledger_custody: ledger.toString(),
           in_flight_out: inFlightOut.toString(),
