@@ -6,6 +6,7 @@
  * 1. Запускает cloudflared quick tunnel (бесплатно, без аккаунта) на http://localhost:API_PORT.
  * 2. Ждёт, пока адрес *.trycloudflare.com начнёт отвечать (DNS туннеля появляется не мгновенно).
  * 3. Пересоздаёт подписку Circle на новый адрес — у quick tunnel адрес меняется при каждом перезапуске.
+ *    Адрес только выводится в консоль: вручную переподписаться можно через `pnpm circle:subscribe <url>`.
  * Туннель живёт, пока работает скрипт (Ctrl+C — остановить). Если туннель упадёт, вебхуки перестанут
  * приходить, но данные догонит reconciliation (ADR-0006) — просто медленнее.
  */
@@ -13,7 +14,6 @@ import { spawn } from 'node:child_process';
 import { createCircleClient } from '../src/circle';
 import { loadApiConfig } from '../src/config';
 import { createLogger } from '../src/lib/logger';
-import { upsertEnvValues } from './lib/env-file';
 import { subscribeWebhooks, WEBHOOK_PATH } from './lib/subscribe';
 
 const { API_PORT } = loadApiConfig();
@@ -59,6 +59,7 @@ for (let attempt = 1; ; attempt++) {
   await new Promise((r) => setTimeout(r, 2_000));
 }
 
-upsertEnvValues({ PUBLIC_API_URL: publicUrl });
+// В .env адрес НЕ пишем: `node --watch` в `pnpm dev` перезапускает api при любом изменении env-файла,
+// и проверочный HEAD от Circle попал бы ровно в момент рестарта (5xx → подписка отклонена).
 await subscribeWebhooks(createCircleClient(createLogger('tunnel')), publicUrl);
 console.log('Готово. Вебхуки Circle идут через туннель. Ctrl+C — остановить.');

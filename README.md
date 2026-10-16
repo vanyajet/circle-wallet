@@ -110,6 +110,8 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 2. ждёт, пока адрес начнёт отвечать (DNS нового туннеля иногда появляется через 1–2 минуты);
 3. пересоздаёт подписку Circle на `…/webhooks/circle`. Circle проверяет URL HEAD-запросом, поэтому api должен быть запущен.
 
+### Обращаю внимание, тунель поскольку бесплатный может подниматься долго, поэтому может потребоваться 20-50 попыток (выполняются автоматически) что бы создать туннель
+
 При каждом перезапуске quick tunnel получает новый адрес, и подписка пересоздаётся автоматически.
 
 Без туннеля приложение тоже работает: reconciliation по pg_cron догонит все депозиты и статусы, только медленнее (до минуты).
@@ -131,7 +133,7 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 | `CIRCLE_WALLET_SET_ID` | да* | Заполняет `pnpm circle:bootstrap` |
 | `CIRCLE_TREASURY_WALLET_ID` | да* | Заполняет `pnpm circle:bootstrap` |
 | `CIRCLE_REQUEST_TIMEOUT_MS` | нет | Таймаут запроса к Circle, по умолчанию 15000 |
-| `PUBLIC_API_URL` | нет | Публичный адрес api; заполняет `pnpm tunnel` |
+| `PUBLIC_API_URL` | нет | Публичный адрес api — только для ручной `pnpm circle:subscribe` без аргумента |
 | `DATABASE_URL` | да | Supabase **Session pooler** URI |
 | `DB_POOL_MAX` | нет | Пул соединений на процесс, по умолчанию 3 (пул pooler'а на free tier маленький) |
 | `DATABASE_SSL` | нет | `auto` (TLS везде, кроме localhost) / `require` / `disable` |

@@ -25,6 +25,18 @@ export async function subscribeWebhooks(circle: CircleClient, publicUrl: string)
     console.log(`Подписка уже существует: ${current.id} → ${endpoint}`);
     return;
   }
-  const created = await circle.createSubscription({ endpoint, notificationTypes: NOTIFICATION_TYPES });
-  console.log(`Создана подписка ${created.id} → ${endpoint} (${NOTIFICATION_TYPES.join(', ')})`);
+  // Circle проверяет endpoint HEAD-запросом. Если api в этот момент перезапускается (watch-режим после правки кода)
+  // или туннель ещё «прогревается», проверка падает с 5xx — повторяем несколько раз, а не сдаёмся сразу.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const created = await circle.createSubscription({ endpoint, notificationTypes: NOTIFICATION_TYPES });
+      console.log(`Создана подписка ${created.id} → ${endpoint} (${NOTIFICATION_TYPES.join(', ')})`);
+      return;
+    } catch (error) {
+      const verificationFailed = error instanceof Error && error.message.includes('Failed to verify endpoint');
+      if (!verificationFailed || attempt >= 6) throw error;
+      console.log(`Circle не смог проверить endpoint (попытка ${attempt}), повтор через 5 с...`);
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+  }
 }
