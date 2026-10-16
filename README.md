@@ -70,6 +70,7 @@ Fullstack-криптокошелёк на [Circle Developer-Controlled Wallets](
 pnpm install
 cp .env.example .env
 ```
+### Вместе с тестовым заданием направлю актуальный .env файл через Екатерину с готовым сетапом
 
 ### 1. Circle
 1. Зарегистрируйтесь в [Circle Console](https://console.circle.com). Аккаунт бесплатный, по умолчанию testnet.
@@ -187,29 +188,6 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 | `GET` | `/ops/overview` | Treasury, ликвидность, house, тождество леджера, очередь задач, сверка с on-chain, последние sweep и входящие на treasury |
 | `HEAD`, `POST` | `/webhooks/circle` | Вебхуки Circle (подпись проверяется) |
 
-### Создание вывода
-```http
-POST /users/{id}/withdrawals
-Idempotency-Key: 6f1c…-uuid
-Content-Type: application/json
-
-{ "token": "USDC", "amount": "1.5", "destinationAddress": "0xAbC…" }
-```
-- **`202`** — вывод принят, средства в резерве. Тело — `OperationDto` со статусом `PENDING`.
-- **Повтор с тем же `Idempotency-Key` и тем же телом** возвращает тот же вывод (`200`). С другим телом — `409 IDEMPOTENCY_KEY_REUSED`.
-- **Проверки:** EVM-адрес с EIP-55 checksum; сумма больше нуля и не длиннее decimals токена. Запрещены нулевой адрес, адрес контракта токена, treasury и собственный deposit-адрес.
-
-`OperationDto`:
-```json
-{
-  "id": "uuid", "type": "WITHDRAWAL", "token": "USDC", "amount": "1.5",
-  "status": "SUBMITTED", "circleState": "SENT", "txHash": null,
-  "counterpartyAddress": "0xabc…", "awaitingLiquidity": false,
-  "errorReason": null, "errorDetails": null,
-  "createdAt": "…", "updatedAt": "…", "completedAt": null
-}
-```
-
 ### Статусы
 | Операция | Статусы |
 |---|---|
@@ -256,7 +234,7 @@ Content-Type: application/json
 
 | Решение | Почему |
 |---|---|
-| **Omnibus: treasury + deposit-адреса + sweep** ([ADR-0001](docs/adr/0001-omnibus-custody-model.md)) | Так работают реальные кастодиальные кошельки и биржи: единая ликвидность, учёт в леджере, готовность к hot/cold. Sweep проводится по своей outbound-транзакции; входящие на treasury классифицируются (sweep / house float), при сомнении — в безопасную сторону |
+| **Omnibus: treasury + deposit-адреса + sweep** ([ADR-0001](docs/adr/0001-omnibus-custody-model.md)) | Так работают реальные кастодиальные кошельки и биржи (как мы обсуждали на тех собесе) : единая ликвидность, учёт в леджере, готовность к hot/cold. Sweep проводится по своей outbound-транзакции; входящие на treasury классифицируются (sweep / house float), при сомнении — на ручной разбор |
 | **SCA + Gas Station** ([ADR-0002](docs/adr/0002-sca-wallets-gas-station.md)) | EOA (тип по умолчанию у Circle) платит газ в ETH, которого нет в публичном фаусете. SCA на тестнете спонсируется Circle |
 | **Double-entry ledger с инвариантами в БД** ([ADR-0003](docs/adr/0003-double-entry-ledger.md)) | Баланс проводки, append-only, exactly-once (`UNIQUE(kind, reference_id)`) и `CHECK balance ≥ 0` гарантирует Postgres, а не только код. Кешированный баланс обновляется триггером в той же транзакции. Суммы — `numeric(78,0)` в минимальных единицах, в коде `bigint`, никакого float |
 | **Supabase как managed Postgres, прямое подключение + Kysely** ([ADR-0004](docs/adr/0004-supabase-as-managed-postgres-kysely.md)) | Нужны транзакции из кода, `SKIP LOCKED`, `LISTEN/NOTIFY` и точный `numeric`. У `supabase-js` (PostgREST) этого нет: каждый вызов — отдельная HTTP-транзакция, а `numeric` превращается в JSON number |
@@ -314,7 +292,7 @@ docs/                      design-doc, ADR, исследование Circle API
 - **Аутентификации нет** (по ТЗ). В проде нужны authN/authZ на `/users/:id/*`, отдельная защита `/ops`, rate limiting и AML-скоринг адресов вывода.
 - **Один hot wallet** — узкое место по throughput: у SCA ограничена очередь транзакций на кошелёк. В проде используют пул hot wallets.
 - **STUCK-транзакции** только наблюдаются. Авто-accelerate — future work.
-- **Внутренние переводы** между пользователями идут on-chain. Можно делать off-chain проводкой.
+- **Внутренние переводы** между пользователями идут on-chain. Можно делать off-chain проводкой (как у bybit и других бирж по uid).
 - **Снапшоты балансов** не нужны на текущих объёмах. Схема к ним готова (pg_cron).
 - **TLS к Supabase** без проверки сертификата (`rejectUnauthorized: false`). В проде нужно закрепить CA Supabase.
 - **Supabase free tier** засыпает после 7 дней неактивности, вместе с pg_cron.
