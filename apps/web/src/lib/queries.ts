@@ -1,12 +1,14 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   IDEMPOTENCY_KEY_HEADER,
+  type CreateInternalTransferRequest,
   type CreateUserRequest,
   type CreateWithdrawalRequest,
   type OperationDto,
   type OperationsPageDto,
   type OpsOverviewDto,
   type TokensListDto,
+  type TransferRecipientDto,
   type UserDetailsDto,
   type UserSummaryDto,
   type UsersListDto,
@@ -21,6 +23,7 @@ export const queryKeys = {
   users: ['users'] as const,
   user: (id: string) => ['user', id] as const,
   operations: (id: string) => ['operations', id] as const,
+  transferRecipient: (uid: string) => ['transfer-recipient', uid] as const,
   ops: ['ops'] as const,
 };
 
@@ -62,6 +65,18 @@ export function useOperations(userId: string) {
   });
 }
 
+/** Получатель перевода для подтверждения (маскированное имя). null — UID ещё не введён целиком. */
+export function useTransferRecipient(uid: string | null) {
+  return useQuery({
+    queryKey: queryKeys.transferRecipient(uid ?? ''),
+    queryFn: ({ signal }) =>
+      apiFetch<TransferRecipientDto>(`/transfer-recipients/${encodeURIComponent(uid ?? '')}`, { signal }),
+    enabled: uid !== null,
+    // Имя пользователя не меняется — повторно не спрашиваем.
+    staleTime: 5 * 60_000,
+  });
+}
+
 export function useOpsOverview() {
   return useQuery({
     queryKey: queryKeys.ops,
@@ -98,5 +113,30 @@ export function useCreateWithdrawal(userId: string) {
         queryClient.invalidateQueries({ queryKey: queryKeys.user(userId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.operations(userId) }),
       ]),
+  });
+}
+
+export interface CreateTransferVariables {
+  body: CreateInternalTransferRequest;
+  idempotencyKey: string;
+}
+
+export function useCreateTransfer(userId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ body, idempotencyKey }: CreateTransferVariables) =>
+      apiFetch<OperationDto>(`${userPath(userId)}/transfers`, {
+        method: 'POST',
+        headers: { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey },
+        body: JSON.stringify(body),
+      }),
+    // Перевод меняет данные обеих сторон; SSE пришлёт invalidate, но обновляем сразу.
+    onSuccess: (_operation, { body }) =>
+      Promise.all(
+        [userId, body.recipientUid].flatMap((id) => [
+          queryClient.invalidateQueries({ queryKey: queryKeys.user(id) }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.operations(id) }),
+        ]),
+      ),
   });
 }

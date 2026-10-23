@@ -2,6 +2,7 @@
  * REST API для фронтенда. Контракт — packages/shared/src/api.ts.
  */
 import {
+  CreateInternalTransferRequestSchema,
   CreateUserRequestSchema,
   CreateWithdrawalRequestSchema,
   IDEMPOTENCY_KEY_HEADER,
@@ -13,11 +14,12 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { sql } from 'kysely';
 import { z } from 'zod';
 import type { AppContext } from '../../domain/context';
-import { listOperations, withdrawalToOperationDto } from '../../domain/operations';
+import { listOperations, transferToOperationDto, withdrawalToOperationDto } from '../../domain/operations';
 import { getOpsOverview } from '../../domain/ops';
+import { createInternalTransfer, getTransferRecipient } from '../../domain/transfers';
 import { assertUserExists, createUser, getUserDetails, listUsers } from '../../domain/users';
 import { createWithdrawal } from '../../domain/withdrawals';
-import { AppError } from '../../lib/errors';
+import { AppError, notFound } from '../../lib/errors';
 import type { SseHub } from '../../realtime/sse-hub';
 
 const UserIdParam = z.uuid();
@@ -101,6 +103,26 @@ export function apiRouter(ctx: AppContext, sse: SseHub): Router {
       const { withdrawal, replayed } = await createWithdrawal(ctx, userId, req.header(IDEMPOTENCY_KEY_HEADER), body);
       // 202: вывод принят в обработку; повтор с тем же ключом возвращает тот же вывод (200).
       res.status(replayed ? 200 : 202).json(withdrawalToOperationDto(ctx, withdrawal));
+    }),
+  );
+
+  router.get(
+    '/transfer-recipients/:uid',
+    handle(async (req, res) => {
+      const uid = UserIdParam.safeParse(req.params.uid);
+      if (!uid.success) throw notFound('Получатель');
+      res.json(await getTransferRecipient(ctx, uid.data));
+    }),
+  );
+
+  router.post(
+    '/users/:id/transfers',
+    handle(async (req, res) => {
+      const userId = parseUserId(req);
+      const body = CreateInternalTransferRequestSchema.parse(req.body);
+      const { transfer, replayed } = await createInternalTransfer(ctx, userId, req.header(IDEMPOTENCY_KEY_HEADER), body);
+      // 201: перевод создан и уже выполнен — он атомарен; повтор с тем же ключом возвращает тот же перевод (200).
+      res.status(replayed ? 200 : 201).json(transferToOperationDto(ctx, transfer));
     }),
   );
 

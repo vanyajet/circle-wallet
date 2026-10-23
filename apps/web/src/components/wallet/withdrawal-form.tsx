@@ -14,7 +14,7 @@ import { useCreateWithdrawal, useTokens } from '@/lib/queries';
 import { Card } from '../card';
 import { ErrorMessage, errorMessage } from '../query-state';
 
-function validateAmount(amount: string, decimals: number, available: string | undefined): string | null {
+export function validateAmount(amount: string, decimals: number, available: string | undefined): string | null {
   if (!amount) return 'Введите сумму';
   if (!isValidAmount(amount, decimals)) {
     return `Введите положительное число через точку, не более ${decimals} знаков после точки`;
@@ -41,7 +41,7 @@ function validateDestination(destination: string, ownAddress: string | null): st
   return null;
 }
 
-const inputClass =
+export const inputClass =
   'w-full rounded border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none disabled:bg-gray-100';
 
 export function WithdrawalForm({ user }: { user: UserDetailsDto }) {

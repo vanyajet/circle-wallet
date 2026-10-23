@@ -1,5 +1,6 @@
 import type {
   DepositStatus,
+  InternalTransferStatus,
   OperationStatus,
   OperationType,
   WalletStatus,
@@ -25,6 +26,10 @@ const WITHDRAWAL_LABELS: Record<WithdrawalStatus, string> = {
   FAILED: 'Не выполнен',
 };
 
+const TRANSFER_LABELS: Record<InternalTransferStatus, string> = {
+  COMPLETED: 'Выполнен',
+};
+
 const OPERATION_TONES: Record<OperationStatus, BadgeTone> = {
   PENDING: 'amber',
   SUBMITTING: 'blue',
@@ -34,7 +39,8 @@ const OPERATION_TONES: Record<OperationStatus, BadgeTone> = {
 };
 
 export function operationStatusLabel(type: OperationType, status: OperationStatus): string {
-  const labels: Partial<Record<OperationStatus, string>> = type === 'DEPOSIT' ? DEPOSIT_LABELS : WITHDRAWAL_LABELS;
+  const labels: Partial<Record<OperationStatus, string>> =
+    type === 'DEPOSIT' ? DEPOSIT_LABELS : type === 'WITHDRAWAL' ? WITHDRAWAL_LABELS : TRANSFER_LABELS;
   return labels[status] ?? status;
 }
 

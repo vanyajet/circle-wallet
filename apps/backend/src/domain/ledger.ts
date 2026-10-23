@@ -50,6 +50,34 @@ export async function lockAccount(trx: Tx, ref: AccountRef): Promise<{ id: strin
   return { id: row.id, balance: BigInt(row.balance) };
 }
 
+/**
+ * Заблокировать несколько счетов и вернуть их балансы в порядке аргументов.
+ * Нужно, когда одна транзакция решает сразу по нескольким счетам (перевод между пользователями).
+ * Порядок детерминирован на обоих шагах, иначе встречные транзакции (A→B и B→A) ловят deadlock:
+ *  1. счета создаются в порядке ключа счёта: транзакции, создающие одни и те же новые счета, ждут
+ *     незакоммиченную вставку друг друга так же, как блокировку строки;
+ *  2. строки блокируются в порядке account_id — в том же, в каком postLedgerTransaction вставляет записи
+ *     (а триггер обновляет балансы), так что проводка дальше не берёт блокировок в другом порядке.
+ */
+export async function lockAccounts(trx: Tx, refs: AccountRef[]): Promise<Array<{ id: string; balance: bigint }>> {
+  const keyOf = (ref: AccountRef) => [ref.type, ref.token, ref.userId ?? '', ref.walletId ?? ''].join(':');
+  const idByKey = new Map<string, string>();
+  for (const ref of [...refs].sort((a, b) => compareStrings(keyOf(a), keyOf(b)))) {
+    idByKey.set(keyOf(ref), await ensureAccount(trx, ref));
+  }
+  const balanceById = new Map<string, bigint>();
+  for (const id of [...new Set(idByKey.values())].sort(compareStrings)) {
+    const row = await trx.selectFrom('app.ledger_accounts').select('balance').where('id', '=', id).forUpdate().executeTakeFirstOrThrow();
+    balanceById.set(id, BigInt(row.balance));
+  }
+  return refs.map((ref) => {
+    const id = idByKey.get(keyOf(ref))!;
+    return { id, balance: balanceById.get(id)! };
+  });
+}
+
+const compareStrings = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
 export async function getAccountBalance(db: DbExecutor, ref: AccountRef): Promise<bigint> {
   const row = await findAccountQuery(db, ref).select('balance').executeTakeFirst();
   return row ? BigInt(row.balance) : 0n;

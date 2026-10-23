@@ -21,10 +21,12 @@ export type LedgerKind =
   | 'WITHDRAWAL_SETTLE'
   | 'WITHDRAWAL_RELEASE'
   | 'SWEEP_SETTLE'
-  | 'HOUSE_FUNDING';
+  | 'HOUSE_FUNDING'
+  | 'INTERNAL_TRANSFER';
 export type Direction = 'DEBIT' | 'CREDIT';
 export type DepositStatus = 'PENDING' | 'COMPLETED' | 'FAILED';
 export type WithdrawalStatus = 'PENDING' | 'SUBMITTING' | 'SUBMITTED' | 'COMPLETED' | 'FAILED';
+export type InternalTransferStatus = 'COMPLETED';
 export type SweepStatus = 'PENDING' | 'SUBMITTED' | 'COMPLETED' | 'FAILED';
 export type TreasuryInboundClassification = 'PENDING' | 'SWEEP' | 'HOUSE_FUNDING' | 'UNCLASSIFIED' | 'FAILED';
 export type JobStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'DEAD';
@@ -129,6 +131,19 @@ export interface WithdrawalsTable {
   last_reconciled_at: NullableTimestamp;
 }
 
+export interface InternalTransfersTable {
+  id: Generated<string>;
+  sender_user_id: string;
+  recipient_user_id: string;
+  token: string;
+  amount: Numeric;
+  status: Generated<InternalTransferStatus>;
+  idempotency_key: string;
+  request_hash: string;
+  created_at: Generated<Date>;
+  completed_at: Generated<Date>;
+}
+
 export interface SweepsTable {
   id: Generated<string>;
   wallet_id: string;
@@ -217,6 +232,7 @@ export interface Database {
   'app.ledger_entries': LedgerEntriesTable;
   'app.deposits': DepositsTable;
   'app.withdrawals': WithdrawalsTable;
+  'app.internal_transfers': InternalTransfersTable;
   'app.sweeps': SweepsTable;
   'app.treasury_inbounds': TreasuryInboundsTable;
   'app.webhook_events': WebhookEventsTable;
@@ -229,6 +245,7 @@ export type Wallet = Selectable<WalletsTable>;
 export type Token = Selectable<TokensTable>;
 export type Deposit = Selectable<DepositsTable>;
 export type Withdrawal = Selectable<WithdrawalsTable>;
+export type InternalTransfer = Selectable<InternalTransfersTable>;
 export type Sweep = Selectable<SweepsTable>;
 export type TreasuryInbound = Selectable<TreasuryInboundsTable>;
 export type Job = Selectable<JobsTable>;

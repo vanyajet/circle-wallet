@@ -1,7 +1,8 @@
 /**
  * Интеграционные тесты денежных потоков на настоящем Postgres (миграции + триггеры) и фейковом Circle.
  * Проверяют то, о чём спросят на ревью в первую очередь: double-spend, идемпотентность, порядок
- * и дубли вебхуков, потерянный ответ Circle, ликвидность treasury, sweep vs house float.
+ * и дубли вебхуков, потерянный ответ Circle, ликвидность treasury, sweep vs house float,
+ * переводы по UID (атомарность, встречные переводы без deadlock).
  */
 import { randomUUID } from 'node:crypto';
 import { sql } from 'kysely';
@@ -10,8 +11,10 @@ import { CircleApiError } from '../../src/circle/errors';
 import type { CircleTransaction } from '../../src/circle/gateway';
 import { applyCircleTransaction } from '../../src/domain/circle-events';
 import { getAccountBalance, custody, house, userAvailable, userHeld } from '../../src/domain/ledger';
+import { listOperations } from '../../src/domain/operations';
 import { getOpsOverview } from '../../src/domain/ops';
 import { runSweep } from '../../src/domain/sweeps';
+import { createInternalTransfer, getTransferRecipient } from '../../src/domain/transfers';
 import { classifyTreasuryInbound } from '../../src/domain/treasury';
 import { createUser } from '../../src/domain/users';
 import { createDepositWallet, ensureTreasuryWallet, requireTreasuryWallet } from '../../src/domain/wallets';
@@ -462,5 +465,163 @@ describe('sweep и классификация входящих на treasury', (
     const { wallet } = await newUserWithWallet('dust');
     await deposit(wallet.circle_wallet_id!, '0.5');
     expect(await runSweep(env.ctx, wallet.id, 'USDC')).toBe('NOOP:below_threshold');
+  });
+});
+
+describe('переводы по UID (off-chain)', () => {
+  const transfer = (senderId: string, recipientUid: string, amount: string, token = 'USDC', key: string = randomUUID()) =>
+    createInternalTransfer(env.ctx, senderId, key, { token, amount, recipientUid });
+
+  it('мгновенно переносит available, не трогает custody и виден обеим сторонам', async () => {
+    const alice = await newUserWithWallet('alice');
+    const bob = await newUserWithWallet('bob');
+    await deposit(alice.wallet.circle_wallet_id!, '10');
+    const treasury = await requireTreasuryWallet(env.db);
+    const custodyBefore = await getAccountBalance(env.db, custody(alice.wallet.id, 'USDC'));
+    const treasuryBefore = await getAccountBalance(env.db, custody(treasury.id, 'USDC'));
+    const circleTransfersBefore = env.circle.transfers.size;
+
+    const { transfer: t, replayed } = await transfer(alice.userId, bob.userId, '4');
+    expect(replayed).toBe(false);
+    expect(t.status).toBe('COMPLETED');
+
+    expect(await getAccountBalance(env.db, userAvailable(alice.userId, 'USDC'))).toBe(usdc('6'));
+    expect(await getAccountBalance(env.db, userAvailable(bob.userId, 'USDC'))).toBe(usdc('4'));
+    // Деньги физически остались, где лежали: перевод меняет только «кому мы должны».
+    expect(await getAccountBalance(env.db, custody(alice.wallet.id, 'USDC'))).toBe(custodyBefore);
+    expect(await getAccountBalance(env.db, custody(treasury.id, 'USDC'))).toBe(treasuryBefore);
+    const postings = await env.db
+      .selectFrom('app.ledger_transactions')
+      .select(['kind'])
+      .where('reference_id', '=', t.id)
+      .execute();
+    expect(postings).toEqual([{ kind: 'INTERNAL_TRANSFER' }]);
+    expect(env.circle.transfers.size).toBe(circleTransfersBefore);
+    await expectLedgerBalanced();
+
+    const [out] = (await listOperations(env.ctx, alice.userId, 10, undefined)).items;
+    expect(out).toMatchObject({ id: t.id, type: 'TRANSFER_OUT', amount: '4', status: 'COMPLETED', counterpartyUid: bob.userId, txHash: null });
+    const [incoming] = (await listOperations(env.ctx, bob.userId, 10, undefined)).items;
+    expect(incoming).toMatchObject({ id: t.id, type: 'TRANSFER_IN', amount: '4', counterpartyUid: alice.userId });
+  });
+
+  it('получатель с ещё не созданным кошельком получает перевод: Circle не участвует', async () => {
+    const sender = await newUserWithWallet('sender');
+    await deposit(sender.wallet.circle_wallet_id!, '2');
+    const recipient = await createUser(env.ctx, 'no-wallet-yet');
+    expect(recipient.walletStatus).toBe('PENDING');
+
+    await transfer(sender.userId, recipient.id, '2');
+    expect(await getAccountBalance(env.db, userAvailable(recipient.id, 'USDC'))).toBe(usdc('2'));
+    expect(await getAccountBalance(env.db, userAvailable(sender.userId, 'USDC'))).toBe(0n);
+  });
+
+  it('параллельные переводы не могут потратить больше баланса (double-spend)', async () => {
+    const sender = await newUserWithWallet('transfer-race');
+    const recipient = await newUserWithWallet('transfer-race-recipient');
+    await deposit(sender.wallet.circle_wallet_id!, '10');
+
+    const results = await Promise.allSettled(Array.from({ length: 6 }, () => transfer(sender.userId, recipient.userId, '3')));
+    const ok = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(ok).toHaveLength(3);
+    for (const r of rejected) expect((r.reason as AppError).code).toBe('INSUFFICIENT_FUNDS');
+
+    expect(await getAccountBalance(env.db, userAvailable(sender.userId, 'USDC'))).toBe(usdc('1'));
+    expect(await getAccountBalance(env.db, userAvailable(recipient.userId, 'USDC'))).toBe(usdc('9'));
+    await expectLedgerBalanced();
+  });
+
+  it('встречные переводы A→B и B→A одновременно не ловят deadlock', async () => {
+    const a = await newUserWithWallet('ping');
+    const b = await newUserWithWallet('pong');
+    await deposit(a.wallet.circle_wallet_id!, '10');
+    await deposit(b.wallet.circle_wallet_id!, '10');
+
+    // Без детерминированного порядка блокировок часть транзакций упала бы с 40P01 (deadlock detected).
+    const results = await Promise.allSettled(
+      Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? transfer(a.userId, b.userId, '1') : transfer(b.userId, a.userId, '1'))),
+    );
+    expect(results.filter((r) => r.status === 'rejected')).toEqual([]);
+    expect(await getAccountBalance(env.db, userAvailable(a.userId, 'USDC'))).toBe(usdc('10'));
+    expect(await getAccountBalance(env.db, userAvailable(b.userId, 'USDC'))).toBe(usdc('10'));
+
+    // Счетов EURC ещё нет ни у кого: встречные транзакции создают одни и те же новые счета.
+    // Ответ должен быть честным 422, а не deadlock на незакоммиченных вставках.
+    const fresh = await Promise.allSettled(
+      Array.from({ length: 10 }, (_, i) => (i % 2 === 0 ? transfer(a.userId, b.userId, '1', 'EURC') : transfer(b.userId, a.userId, '1', 'EURC'))),
+    );
+    for (const r of fresh) {
+      expect(r.status).toBe('rejected');
+      expect(((r as PromiseRejectedResult).reason as AppError).code).toBe('INSUFFICIENT_FUNDS');
+    }
+    await expectLedgerBalanced();
+  });
+
+  it('Idempotency-Key: параллельный повтор возвращает тот же перевод, другое тело — 409', async () => {
+    const sender = await newUserWithWallet('transfer-idem');
+    const recipient = await newUserWithWallet('transfer-idem-recipient');
+    await deposit(sender.wallet.circle_wallet_id!, '5');
+    const key = randomUUID();
+
+    // На весь баланс: проигравший гонку не должен получить 422 вместо того же перевода.
+    const results = await Promise.all(Array.from({ length: 3 }, () => transfer(sender.userId, recipient.userId, '5', 'USDC', key)));
+    expect(new Set(results.map((r) => r.transfer.id)).size).toBe(1);
+    expect(results.filter((r) => !r.replayed)).toHaveLength(1);
+    expect(await getAccountBalance(env.db, userAvailable(recipient.userId, 'USDC'))).toBe(usdc('5'));
+
+    // UID в другом регистре — тот же запрос, а не «другое тело».
+    const replay = await transfer(sender.userId, recipient.userId.toUpperCase(), '5', 'USDC', key);
+    expect(replay).toMatchObject({ replayed: true, transfer: { id: results[0]!.transfer.id } });
+    await expect(transfer(sender.userId, recipient.userId, '4', 'USDC', key)).rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_REUSED' });
+  });
+
+  it('отклоняет перевод себе, неизвестному получателю, сверх баланса и некорректные запросы', async () => {
+    const sender = await newUserWithWallet('transfer-validation');
+    const recipient = await newUserWithWallet('Ivan Petrov');
+    await deposit(sender.wallet.circle_wallet_id!, '1');
+
+    await expect(transfer(sender.userId, sender.userId, '1')).rejects.toMatchObject({ code: 'SELF_TRANSFER' });
+    await expect(transfer(sender.userId.toUpperCase(), sender.userId, '1')).rejects.toMatchObject({ code: 'SELF_TRANSFER' });
+    await expect(transfer(sender.userId, randomUUID(), '1')).rejects.toMatchObject({ code: 'RECIPIENT_NOT_FOUND' });
+    await expect(transfer(sender.userId, 'not-a-uid', '1')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    await expect(transfer(sender.userId, recipient.userId, '1.5')).rejects.toMatchObject({
+      code: 'INSUFFICIENT_FUNDS',
+      details: { available: '1' },
+    });
+    await expect(transfer(sender.userId, recipient.userId, '0')).rejects.toMatchObject({ code: 'INVALID_AMOUNT' });
+    await expect(transfer(sender.userId, recipient.userId, '0.0000001')).rejects.toMatchObject({ code: 'INVALID_AMOUNT' });
+    await expect(transfer(sender.userId, recipient.userId, '1', 'ETH')).rejects.toMatchObject({ code: 'TOKEN_NOT_SUPPORTED' });
+    await expect(
+      createInternalTransfer(env.ctx, sender.userId, undefined, { token: 'USDC', amount: '1', recipientUid: recipient.userId }),
+    ).rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_REQUIRED' });
+    await expect(transfer(randomUUID(), recipient.userId, '1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(await getAccountBalance(env.db, userAvailable(sender.userId, 'USDC'))).toBe(usdc('1'));
+
+    // Подтверждение получателя: маскированное имя, без балансов и адресов.
+    expect(await getTransferRecipient(env.ctx, recipient.userId)).toEqual({ uid: recipient.userId, maskedName: 'Iv***' });
+    await expect(getTransferRecipient(env.ctx, randomUUID())).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('полученное переводом выводится on-chain из treasury как обычно', async () => {
+    await fundHouse('10');
+    const sender = await newUserWithWallet('transfer-then-withdraw');
+    const recipient = await newUserWithWallet('withdraws-received');
+    await deposit(sender.wallet.circle_wallet_id!, '3');
+    await transfer(sender.userId, recipient.userId, '3');
+
+    const { withdrawal } = await createWithdrawal(env.ctx, recipient.userId, randomUUID(), {
+      token: 'USDC',
+      amount: '3',
+      destinationAddress: EXTERNAL,
+    });
+    expect(await submitWithdrawal(env.ctx, withdrawal.id)).toEqual({ type: 'done', result: 'SUBMITTED' });
+    const submitted = await env.db.selectFrom('app.withdrawals').selectAll().where('id', '=', withdrawal.id).executeTakeFirstOrThrow();
+    const done = env.circle.setState(submitted.circle_transaction_id!, 'OUTBOUND', { state: 'COMPLETE', txHash: '0xdef' });
+    expect(await applyCircleTransaction(env.ctx, done, 'webhook')).toBe('APPLIED:COMPLETED');
+
+    expect(await getAccountBalance(env.db, userAvailable(recipient.userId, 'USDC'))).toBe(0n);
+    expect(await getAccountBalance(env.db, userHeld(recipient.userId, 'USDC'))).toBe(0n);
+    await expectLedgerBalanced();
   });
 });

@@ -1,6 +1,9 @@
 /** Простая проверка формата для UX; полную валидацию (EIP-55, запрещённые адреса) делает бэкенд. */
 export const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
+/** UID пользователя — его id (UUID). */
+export const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const EXPLORER_URL = 'https://sepolia.basescan.org';
 
 /** 0x1234567890…abcd → 0x1234…abcd */

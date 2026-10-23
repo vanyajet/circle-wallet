@@ -10,8 +10,10 @@
  *   GET  /users                               → UsersListDto (новые сверху)
  *   POST /users            CreateUserRequest  → 201 UserSummaryDto (кошелёк создаётся асинхронно: walletStatus=PENDING)
  *   GET  /users/:id                           → UserDetailsDto
- *   GET  /users/:id/operations?limit&cursor   → OperationsPageDto (депозиты и выводы, новые сверху)
+ *   GET  /users/:id/operations?limit&cursor   → OperationsPageDto (депозиты, выводы и переводы, новые сверху)
  *   POST /users/:id/withdrawals  + заголовок Idempotency-Key (UUID), CreateWithdrawalRequest → 202 OperationDto
+ *   GET  /transfer-recipients/:uid            → TransferRecipientDto (подтверждение получателя перед переводом)
+ *   POST /users/:id/transfers    + заголовок Idempotency-Key (UUID), CreateInternalTransferRequest → 201 OperationDto
  *   GET  /users/:id/events                    → SSE (события одного пользователя)
  *   GET  /events                              → SSE (все события: список пользователей, ops)
  *   GET  /ops/overview                        → OpsOverviewDto
@@ -19,7 +21,7 @@
  *   400 VALIDATION_ERROR | INVALID_AMOUNT | INVALID_ADDRESS | TOKEN_NOT_SUPPORTED | IDEMPOTENCY_KEY_REQUIRED
  *   404 NOT_FOUND
  *   409 IDEMPOTENCY_KEY_REUSED | WALLET_NOT_READY
- *   422 INSUFFICIENT_FUNDS | ADDRESS_NOT_ALLOWED
+ *   422 INSUFFICIENT_FUNDS | ADDRESS_NOT_ALLOWED | RECIPIENT_NOT_FOUND | SELF_TRANSFER
  *   503 SERVICE_UNAVAILABLE, 500 INTERNAL_ERROR
  */
 import { z } from 'zod';
@@ -41,7 +43,16 @@ export const CreateWithdrawalRequestSchema = z.object({
 });
 export type CreateWithdrawalRequest = z.infer<typeof CreateWithdrawalRequestSchema>;
 
-/** Заголовок идемпотентности для POST /users/:id/withdrawals (UUID, генерируется клиентом на каждую попытку формы). */
+export const CreateInternalTransferRequestSchema = z.object({
+  token: z.string().trim().min(1),
+  /** Десятичная строка в единицах токена, например "1.25". Точность проверяется на бэкенде по decimals токена. */
+  amount: z.string().trim().min(1),
+  /** UID получателя — его id пользователя. Регистр не важен: приводим к нижнему, как хранит Postgres. */
+  recipientUid: z.string().trim().toLowerCase().pipe(z.uuid({ error: 'Некорректный UID получателя' })),
+});
+export type CreateInternalTransferRequest = z.infer<typeof CreateInternalTransferRequestSchema>;
+
+/** Заголовок идемпотентности для POST /users/:id/withdrawals и /transfers (UUID, генерируется клиентом на каждую попытку формы). */
 export const IDEMPOTENCY_KEY_HEADER = 'Idempotency-Key';
 
 export const OperationsQuerySchema = z.object({
@@ -95,16 +106,19 @@ export interface UsersListDto {
   items: UserSummaryDto[];
 }
 
-export type OperationType = 'DEPOSIT' | 'WITHDRAWAL';
+/** Перевод по UID: у отправителя — TRANSFER_OUT, у получателя — TRANSFER_IN (одна запись, две стороны). */
+export type OperationType = 'DEPOSIT' | 'WITHDRAWAL' | 'TRANSFER_OUT' | 'TRANSFER_IN';
 
 /**
  * Статусы операций.
  * Депозит: PENDING (виден в сети, ждём финализации) → COMPLETED | FAILED.
  * Вывод: PENDING (средства в резерве) → SUBMITTING (отправляем в Circle) → SUBMITTED (в сети) → COMPLETED | FAILED.
+ * Перевод по UID: off-chain и атомарен — сразу COMPLETED.
  */
 export type DepositStatus = 'PENDING' | 'COMPLETED' | 'FAILED';
 export type WithdrawalStatus = 'PENDING' | 'SUBMITTING' | 'SUBMITTED' | 'COMPLETED' | 'FAILED';
-export type OperationStatus = DepositStatus | WithdrawalStatus;
+export type InternalTransferStatus = 'COMPLETED';
+export type OperationStatus = DepositStatus | WithdrawalStatus | InternalTransferStatus;
 
 export const FINAL_OPERATION_STATUSES: readonly OperationStatus[] = ['COMPLETED', 'FAILED'];
 
@@ -116,9 +130,12 @@ export interface OperationDto {
   status: OperationStatus;
   /** Сырое состояние транзакции в Circle (INITIATED, QUEUED, SENT, CONFIRMED, COMPLETE, ...), если уже известно. */
   circleState: string | null;
+  /** У переводов по UID всегда null: они off-chain. */
   txHash: string | null;
   /** Для депозита — адрес отправителя (если Circle его сообщил), для вывода — адрес получателя. */
   counterpartyAddress: string | null;
+  /** Только для переводов по UID: UID второй стороны (получателя у TRANSFER_OUT, отправителя у TRANSFER_IN). */
+  counterpartyUid: string | null;
   /** Только для выводов: вывод ждёт ликвидности treasury (sweep ещё не завершён). */
   awaitingLiquidity: boolean;
   errorReason: string | null;
@@ -126,6 +143,13 @@ export interface OperationDto {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+}
+
+/** Получатель перевода для подтверждения: только маскированное имя — без балансов и адресов. */
+export interface TransferRecipientDto {
+  uid: string;
+  /** «Iv***»: достаточно, чтобы отправитель узнал получателя, но не раскрывает имя целиком. */
+  maskedName: string;
 }
 
 export interface OperationsPageDto {
@@ -234,6 +258,8 @@ export type ApiErrorCode =
   | 'INVALID_ADDRESS'
   | 'ADDRESS_NOT_ALLOWED'
   | 'INSUFFICIENT_FUNDS'
+  | 'RECIPIENT_NOT_FOUND'
+  | 'SELF_TRANSFER'
   | 'IDEMPOTENCY_KEY_REQUIRED'
   | 'IDEMPOTENCY_KEY_REUSED'
   | 'WALLET_NOT_READY'

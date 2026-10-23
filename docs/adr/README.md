@@ -13,3 +13,4 @@
 | [0007](./0007-own-circle-http-client.md) | Собственный HTTP-клиент Circle вместо SDK |
 | [0008](./0008-sse-over-listen-notify.md) | Real-time через SSE поверх LISTEN/NOTIFY |
 | [0009](./0009-idempotency-strategy.md) | Сквозная стратегия идемпотентности |
+| [0010](./0010-internal-transfers-off-chain.md) | Переводы по UID — off-chain проводка в леджере |

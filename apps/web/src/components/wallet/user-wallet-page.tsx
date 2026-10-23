@@ -5,10 +5,12 @@ import { useQueryClient } from '@tanstack/react-query';
 import { ApiError } from '@/lib/api';
 import { queryKeys, useUser } from '@/lib/queries';
 import { useEventStream } from '@/lib/use-event-stream';
+import { CopyButton } from '../copy-button';
 import { ErrorMessage, Loading } from '../query-state';
 import { BalancesCard } from './balances-card';
 import { DepositCard } from './deposit-card';
 import { OperationsHistory } from './operations-history';
+import { TransferForm } from './transfer-form';
 import { WithdrawalForm } from './withdrawal-form';
 
 function BackLink() {
@@ -52,7 +54,11 @@ export function UserWalletPage({ userId }: { userId: string }) {
       <div>
         <BackLink />
         <h1 className="mt-1 text-2xl font-semibold">{details.name}</h1>
-        <div className="font-mono text-xs text-gray-500">{details.id}</div>
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+          <span>UID</span>
+          <span className="font-mono">{details.id}</span>
+          <CopyButton value={details.id} />
+        </div>
       </div>
 
       {user.isError && <ErrorMessage error={user.error} onRetry={() => void user.refetch()} />}
@@ -61,7 +67,10 @@ export function UserWalletPage({ userId }: { userId: string }) {
         <DepositCard user={details} />
         <BalancesCard balances={details.balances} />
       </div>
-      <WithdrawalForm user={details} />
+      <div className="grid gap-6 lg:grid-cols-2">
+        <WithdrawalForm user={details} />
+        <TransferForm user={details} />
+      </div>
       <OperationsHistory userId={userId} />
     </div>
   );

@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import type { OperationDto } from '@circle-wallet/shared';
-import { formatDateTime } from '@/lib/format';
+import { formatDateTime, shortenHex } from '@/lib/format';
 import { useOperations } from '@/lib/queries';
 import { Card } from '../card';
 import { ShortAddress, TxHashLink } from '../hex';
@@ -13,7 +13,22 @@ import { EmptyRow, Table, Td } from '../table';
 const TYPE_LABELS: Record<OperationDto['type'], string> = {
   DEPOSIT: 'Пополнение',
   WITHDRAWAL: 'Вывод',
+  TRANSFER_OUT: 'Перевод отправлен',
+  TRANSFER_IN: 'Перевод получен',
 };
+
+const isTransfer = (operation: OperationDto) => operation.type === 'TRANSFER_OUT' || operation.type === 'TRANSFER_IN';
+
+function Counterparty({ operation }: { operation: OperationDto }) {
+  if (operation.counterpartyUid) {
+    return (
+      <span className="whitespace-nowrap font-mono text-xs" title={operation.counterpartyUid}>
+        UID {shortenHex(operation.counterpartyUid)}
+      </span>
+    );
+  }
+  return <ShortAddress address={operation.counterpartyAddress} copy={false} />;
+}
 
 const COLUMNS = ['Тип', 'Сумма', 'Статус', 'Circle', 'Контрагент', 'Tx', 'Создана', 'Ошибка'];
 
@@ -34,10 +49,15 @@ function OperationRow({ operation }: { operation: OperationDto }) {
       </Td>
       <Td className="text-xs text-gray-500">{operation.circleState ?? '—'}</Td>
       <Td>
-        <ShortAddress address={operation.counterpartyAddress} copy={false} />
+        <Counterparty operation={operation} />
       </Td>
       <Td>
-        <TxHashLink hash={operation.txHash} />
+        {/* Перевод по UID не выходит в блокчейн — хэша у него нет и не будет. */}
+        {isTransfer(operation) ? (
+          <span className="text-xs text-gray-500">off-chain</span>
+        ) : (
+          <TxHashLink hash={operation.txHash} />
+        )}
       </Td>
       <Td className="whitespace-nowrap text-gray-600">{formatDateTime(operation.createdAt)}</Td>
       <Td className="max-w-xs">

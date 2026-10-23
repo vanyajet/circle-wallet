@@ -1,7 +1,7 @@
 # Circle Wallet
 
 Fullstack-криптокошелёк на [Circle Developer-Controlled Wallets](https://developers.circle.com/wallets/dev-controlled/create-your-first-wallet) в тестовой сети `BASE-SEPOLIA`.
-Пользователь пополняет кошелёк тестовыми USDC/EURC, выводит их на любой внешний адрес и видит баланс и историю операций со статусами в реальном времени.
+Пользователь пополняет кошелёк тестовыми USDC/EURC, выводит их на любой внешний адрес, мгновенно переводит другим пользователям платформы по UID и видит баланс и историю операций со статусами в реальном времени.
 
 - **Бэкенд:** Express + TypeScript. Два процесса: `api` и `worker`.
 - **База:** Supabase (Postgres 17), миграции в `supabase/migrations`.
@@ -162,9 +162,13 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
    - Сумма сразу переходит из `available` в «в резерве» (hold).
    - Статусы идут так: «В очереди» → «Отправляется» → «В сети» → «Выполнен»; при ошибке — «Не выполнен», и средства возвращаются в `available`.
    - Если ликвидности treasury не хватает, вывод показывается «В очереди · ждёт ликвидности treasury» и уходит, как только завершится sweep.
-5. **Баланс и история** обновляются сами через SSE, без перезагрузки страницы.
+5. **Перевод по UID.** Скопируйте UID другого пользователя (под его именем, кнопка «Копировать») и вставьте его в форму «Перевод по UID» у отправителя.
+   - Форма покажет маскированное имя получателя («Получатель: Bo***»): это подтверждение, что перевод уйдёт тому, кому нужно.
+   - Перевод выполняется сразу: off-chain, без газа и без Circle. В истории он «Выполнен» у обоих: «Перевод отправлен» у отправителя, «Перевод получен» у получателя, в колонке Tx — `off-chain`.
+   - Получателю не нужен активный кошелёк: деньги двигаются только в леджере.
+6. **Баланс и история** обновляются сами через SSE, без перезагрузки страницы.
 
-Тестовый Base Sepolia-адрес для вывода можно взять любой свой (MetaMask и т.п.). Также можно вывести на deposit-адрес другого пользователя системы: средства пройдут on-chain и зачислятся ему как депозит.
+Тестовый Base Sepolia-адрес для вывода можно взять любой свой (MetaMask и т.п.). Также можно вывести на deposit-адрес другого пользователя системы: средства пройдут on-chain и зачислятся ему как депозит. Мгновенно и без газа то же делает перевод по UID.
 
 ---
 
@@ -183,8 +187,10 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 | `GET` | `/users` | Список пользователей, новые сверху: `{ items: [{ id, name, createdAt, depositAddress, walletStatus }] }` |
 | `POST` | `/users` | Создать пользователя. Тело `{ "name": "Alice" }` → `201` с `walletStatus: "PENDING"`; адрес появится после создания кошелька в Circle |
 | `GET` | `/users/:id` | Пользователь, deposit-адрес и балансы: `balances: [{ token, decimals, available, held }]` |
-| `GET` | `/users/:id/operations?limit=20&cursor=…` | История депозитов и выводов: `{ items: OperationDto[], nextCursor }` (keyset-пагинация) |
-| `POST` | `/users/:id/withdrawals` | Создать вывод (подробности ниже) |
+| `GET` | `/users/:id/operations?limit=20&cursor=…` | История депозитов, выводов и переводов: `{ items: OperationDto[], nextCursor }` (keyset-пагинация) |
+| `POST` | `/users/:id/withdrawals` | Создать вывод. Заголовок `Idempotency-Key` (UUID), тело `{ token, amount, destinationAddress }` → `202` |
+| `GET` | `/transfer-recipients/:uid` | Получатель перевода для подтверждения: `{ uid, maskedName }`, без балансов и адресов |
+| `POST` | `/users/:id/transfers` | Перевод по UID. Заголовок `Idempotency-Key` (UUID), тело `{ token, amount, recipientUid }` → `201`, выполнен сразу; повтор с тем же ключом → `200` с тем же переводом |
 | `GET` | `/users/:id/events` | SSE-стрим событий пользователя |
 | `GET` | `/events` | SSE-стрим всех событий (список пользователей, ops) |
 | `GET` | `/ops/overview` | Treasury, ликвидность, house, тождество леджера, очередь задач, сверка с on-chain, последние sweep и входящие на treasury |
@@ -195,6 +201,7 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 |---|---|
 | Депозит | `PENDING` (виден в сети, ждём финализации) → `COMPLETED` (зачислен) \| `FAILED` |
 | Вывод | `PENDING` (средства в резерве, ждём отправки/ликвидности) → `SUBMITTING` (отправляем в Circle) → `SUBMITTED` (в сети) → `COMPLETED` \| `FAILED` (средства возвращены) |
+| Перевод по UID | Сразу `COMPLETED`: перевод атомарен. В истории тип `TRANSFER_OUT` у отправителя и `TRANSFER_IN` у получателя, вторая сторона — в `counterpartyUid` |
 
 Сырое состояние Circle (`INITIATED … COMPLETE`) приходит в поле `circleState`.
 
@@ -206,7 +213,7 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 | 400 | `VALIDATION_ERROR`, `INVALID_AMOUNT`, `INVALID_ADDRESS`, `TOKEN_NOT_SUPPORTED`, `IDEMPOTENCY_KEY_REQUIRED` |
 | 404 | `NOT_FOUND` |
 | 409 | `IDEMPOTENCY_KEY_REUSED` |
-| 422 | `INSUFFICIENT_FUNDS` (`details.available`), `ADDRESS_NOT_ALLOWED` |
+| 422 | `INSUFFICIENT_FUNDS` (`details.available`), `ADDRESS_NOT_ALLOWED`, `RECIPIENT_NOT_FOUND`, `SELF_TRANSFER` |
 | 503 | `SERVICE_UNAVAILABLE` (БД недоступна) |
 
 ### SSE
@@ -244,6 +251,7 @@ pnpm tunnel    # во втором терминале: cloudflared quick tunnel 
 | **Inbox вебхуков** ([ADR-0006](docs/adr/0006-webhook-inbox-and-verification.md)) | Circle доставляет at-least-once без гарантии порядка. Мы мгновенно подтверждаем получение, храним сырой payload, обработку повторяем сами. Dedupe по `notificationId` (не по id транзакции) |
 | **Свой HTTP-клиент Circle** ([ADR-0007](docs/adr/0007-own-circle-http-client.md)) | В SDK нет таймаутов и ретраев, он молча подставляет случайный idempotencyKey и не умеет фильтр `refId`. Свой клиент строго следует `CIRCLE_BASE_URL` и валидирует ответы zod |
 | **SSE поверх LISTEN/NOTIFY** ([ADR-0008](docs/adr/0008-sse-over-listen-notify.md)) | NOTIFY доставляется только после commit, поэтому клиент не видит откатившихся изменений. Событие служит invalidate-сигналом, а данные идут по REST, так что пропуски безвредны |
+| **Переводы по UID — off-chain проводка** ([ADR-0010](docs/adr/0010-internal-transfers-off-chain.md)) | При omnibus принадлежность средств определяет только леджер, поэтому перевод — одна проводка `USER_AVAILABLE → USER_AVAILABLE` в одной транзакции: мгновенно, без газа, custody не меняется. Счета блокируются в детерминированном порядке, чтобы встречные переводы не ловили deadlock |
 | **Сквозная идемпотентность** ([ADR-0009](docs/adr/0009-idempotency-strategy.md)) | `Idempotency-Key` клиента; детерминированный `idempotencyKey` к Circle (id сущности) с новым ciphertext на каждый запрос; `refId` для восстановления потерянного ответа |
 
 Что происходит при сбоях (падения процессов, дубли и потеря вебхуков, таймауты Circle, гонки) — в [матрице отказов](docs/design-doc.md#16-матрица-отказов).
@@ -262,7 +270,8 @@ pnpm test     # unit (shared) + интеграционные (backend) — ну�
 - потерянный ответ Circle: второго перевода нет, транзакция находится по `refId`;
 - вебхук, пришедший раньше ответа Circle;
 - явный отказ Circle (средства возвращаются) и временная ошибка (резерв держится);
-- ожидание ликвидности treasury, house float, sweep и классификацию его входящей ноги.
+- ожидание ликвидности treasury, house float, sweep и классификацию его входящей ноги;
+- переводы по UID: custody не меняется, double-spend, идемпотентность, отказы (себе, неизвестному, сверх баланса), встречные переводы A→B / B→A без deadlock.
 
 Инварианты леджера дополнительно проверяет тождество Σ CUSTODY = Σ USER_* + Σ HOUSE после каждого сценария.
 
@@ -275,7 +284,7 @@ apps/
   backend/                 Express API + worker (один пакет, два entrypoint'а)
     src/circle/            свой клиент Circle, схемы ответов, проверка подписи вебхуков
     src/db/                Kysely, типы схемы
-    src/domain/            бизнес-логика: леджер, депозиты, выводы, sweep, treasury, reconciliation
+    src/domain/            бизнес-логика: леджер, депозиты, выводы, переводы по UID, sweep, treasury, reconciliation
     src/jobs/              очередь задач, обработчики, runtime worker'а
     src/http/              Express: REST, вебхуки
     src/realtime/          LISTEN-соединение, SSE hub
@@ -294,7 +303,7 @@ docs/                      design-doc, ADR, исследование Circle API
 - **Аутентификации нет** (по ТЗ). В проде нужны authN/authZ на `/users/:id/*`, отдельная защита `/ops`, rate limiting и AML-скоринг адресов вывода.
 - **Один hot wallet** — узкое место по throughput: у SCA ограничена очередь транзакций на кошелёк. В проде используют пул hot wallets.
 - **STUCK-транзакции** только наблюдаются. Авто-accelerate — future work.
-- **Внутренние переводы** между пользователями идут on-chain. Можно делать off-chain проводкой (как у bybit и других бирж по uid).
+- **Переводы по UID** выполняются сразу, без лимитов и AML-проверок. В проде нужны двухфазная схема (hold → проверки → settle), короткий публичный UID с контрольной цифрой вместо UUID и rate limit на поиск получателя ([ADR-0010](docs/adr/0010-internal-transfers-off-chain.md)).
 - **Снапшоты балансов** не нужны на текущих объёмах. Схема к ним готова (pg_cron).
 - **TLS к Supabase** без проверки сертификата (`rejectUnauthorized: false`). В проде нужно закрепить CA Supabase.
 - **Supabase free tier** засыпает после 7 дней неактивности, вместе с pg_cron.
